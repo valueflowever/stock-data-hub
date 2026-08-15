@@ -44,6 +44,7 @@ from stock_data_hub.normalization import (
     to_beijing,
 )
 from stock_data_hub.providers._parsing import (
+    IntradayTimestampLabel,
     bars_from_dataframe,
     decimal_or_none,
     is_missing,
@@ -52,6 +53,10 @@ from stock_data_hub.providers._parsing import (
     to_datetime,
 )
 from stock_data_hub.providers.base import MarketDataProvider
+
+
+_EASTMONEY_INTRADAY_TIMESTAMP_LABEL = IntradayTimestampLabel.CLOSE
+_SINA_INTRADAY_TIMESTAMP_LABEL = IntradayTimestampLabel.CLOSE
 
 
 class AkShareProvider(MarketDataProvider):
@@ -134,7 +139,15 @@ class AkShareProvider(MarketDataProvider):
                 if _empty_bar_window_is_expected(start, end):
                     return SourcePayload(value=[], source="akshare:eastmoney")
                 raise ProviderUnavailable(f"Eastmoney returned empty bars for {normalized}")
-            bars = _parse_bars(dataframe, normalized, interval, start, end, market)
+            bars = _parse_bars(
+                dataframe,
+                normalized,
+                interval,
+                start,
+                end,
+                market,
+                intraday_timestamp_label=_EASTMONEY_INTRADAY_TIMESTAMP_LABEL,
+            )
             if not bars:
                 raise DataValidationError("Eastmoney returned no usable bars")
             return SourcePayload(value=bars, source="akshare:eastmoney")
@@ -164,7 +177,15 @@ class AkShareProvider(MarketDataProvider):
                             warnings=("Eastmoney bars were unavailable; used Sina fallback.",),
                         )
                     raise ProviderUnavailable(f"Sina returned empty bars for {normalized}")
-                bars = _parse_bars(dataframe, normalized, interval, start, end, Market.CN)
+                bars = _parse_bars(
+                    dataframe,
+                    normalized,
+                    interval,
+                    start,
+                    end,
+                    Market.CN,
+                    intraday_timestamp_label=_SINA_INTRADAY_TIMESTAMP_LABEL,
+                )
                 if not bars:
                     raise DataValidationError("Sina returned no usable bars")
                 return SourcePayload(
@@ -601,6 +622,8 @@ def _parse_bars(
     start: datetime,
     end: datetime,
     market: Market = Market.CN,
+    *,
+    intraday_timestamp_label: IntradayTimestampLabel | None = None,
 ) -> list[AShareBar]:
     return bars_from_dataframe(
         dataframe,
@@ -616,6 +639,7 @@ def _parse_bars(
         close_columns=("收盘", "close"),
         volume_columns=("成交量", "volume"),
         amount_columns=("成交额", "amount"),
+        intraday_timestamp_label=intraday_timestamp_label,
     )
 
 

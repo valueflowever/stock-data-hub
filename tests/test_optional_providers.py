@@ -5,6 +5,7 @@ from decimal import Decimal
 from types import SimpleNamespace
 
 import pandas as pd
+import pytest
 
 from stock_data_hub.models import Adjust, Interval, Market, QuoteFreshness
 from stock_data_hub.normalization import BEIJING_TZ
@@ -197,6 +198,52 @@ def test_efinance_normalizes_bars_quote_and_snapshot() -> None:
     assert stock.history_kwargs["fqt"] == 1
     assert quote.value.price == Decimal("10.5")
     assert [row.symbol for row in snapshot.value.rows] == ["159915.SZ", "600519.SH"]
+
+
+@pytest.mark.parametrize(
+    ("interval", "timestamp", "expected_klt"),
+    [
+        (Interval.MINUTE_15, "2026-07-17 10:00:00", 15),
+        (Interval.HOUR_1, "2026-07-17 10:30:00", 60),
+    ],
+)
+def test_efinance_intraday_bars_declare_close_timestamp_labels(
+    interval: Interval,
+    timestamp: str,
+    expected_klt: int,
+) -> None:
+    class Stock:
+        def __init__(self) -> None:
+            self.history_kwargs: dict[str, object] = {}
+
+        def get_quote_history(self, _: str, **kwargs: object) -> pd.DataFrame:
+            self.history_kwargs = kwargs
+            return pd.DataFrame(
+                {
+                    "date": [timestamp],
+                    "open": [10.0],
+                    "high": [11.0],
+                    "low": [9.5],
+                    "close": [10.5],
+                    "volume": [100],
+                    "amount": [1050],
+                }
+            )
+
+    stock = Stock()
+    provider = EFinanceProvider(client_loader=lambda: SimpleNamespace(stock=stock))
+    close_time = datetime.fromisoformat(timestamp).replace(tzinfo=BEIJING_TZ)
+
+    result = provider.fetch_bars(
+        "600519.SH",
+        interval,
+        close_time,
+        close_time,
+        Adjust.NONE,
+    )
+
+    assert result.value[0].ts == close_time
+    assert stock.history_kwargs["klt"] == expected_klt
 
 
 def test_baostock_logs_in_queries_and_logs_out() -> None:

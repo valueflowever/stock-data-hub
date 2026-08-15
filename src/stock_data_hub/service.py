@@ -68,7 +68,7 @@ def create_app(hub: DataHub | None = None, *, api_key: str | None = None) -> Any
 
     app = FastAPI(
         title="Stock Data Hub",
-        version="0.5.0",
+        version="0.5.1",
         description="Provider-neutral market-data access with source and cache metadata.",
         dependencies=[Depends(require_api_key)],
     )

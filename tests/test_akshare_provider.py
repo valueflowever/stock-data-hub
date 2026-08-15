@@ -149,3 +149,72 @@ def test_chinese_index_bars_use_the_index_endpoint(monkeypatch) -> None:
 
     assert result.value[0].market == Market.CN
     assert client.index_kwargs["period"] == "weekly"
+
+
+def test_eastmoney_intraday_bars_declare_close_timestamp_labels(monkeypatch) -> None:
+    class AkShare:
+        def stock_zh_a_hist_min_em(self, **kwargs: object) -> pd.DataFrame:
+            self.kwargs = kwargs
+            return pd.DataFrame(
+                {
+                    "date": ["2026-07-17 10:00:00"],
+                    "open": [10.0],
+                    "high": [11.0],
+                    "low": [9.5],
+                    "close": [10.5],
+                    "volume": [100],
+                    "amount": [1050],
+                }
+            )
+
+    client = AkShare()
+    monkeypatch.setattr(adapter, "_load_akshare", lambda: client)
+    close_time = datetime(2026, 7, 17, 10, 0, tzinfo=BEIJING_TZ)
+
+    result = adapter.AkShareProvider().fetch_bars(
+        "600519.SH",
+        Interval.MINUTE_15,
+        close_time,
+        close_time,
+        Adjust.NONE,
+    )
+
+    assert result.source == "akshare:eastmoney"
+    assert result.value[0].ts == close_time
+    assert client.kwargs["period"] == "15"
+
+
+def test_sina_intraday_bars_declare_close_timestamp_labels(monkeypatch) -> None:
+    class AkShare:
+        def stock_zh_a_hist_min_em(self, **_: object) -> pd.DataFrame:
+            raise RuntimeError("Eastmoney unavailable")
+
+        def stock_zh_a_minute(self, **kwargs: object) -> pd.DataFrame:
+            self.kwargs = kwargs
+            return pd.DataFrame(
+                {
+                    "date": ["2026-07-17 10:30:00"],
+                    "open": [10.0],
+                    "high": [11.0],
+                    "low": [9.5],
+                    "close": [10.5],
+                    "volume": [100],
+                    "amount": [1050],
+                }
+            )
+
+    client = AkShare()
+    monkeypatch.setattr(adapter, "_load_akshare", lambda: client)
+    close_time = datetime(2026, 7, 17, 10, 30, tzinfo=BEIJING_TZ)
+
+    result = adapter.AkShareProvider().fetch_bars(
+        "600519.SH",
+        Interval.HOUR_1,
+        close_time,
+        close_time,
+        Adjust.NONE,
+    )
+
+    assert result.source == "akshare:sina"
+    assert result.value[0].ts == close_time
+    assert client.kwargs["period"] == "60"

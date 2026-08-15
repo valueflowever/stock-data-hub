@@ -121,6 +121,21 @@ bars = await client.get_bars(
 )
 ```
 
+## K 线时间契约
+
+Hub 对外返回的分钟 K 线 (`15m`、`1h`) 中，`AShareBar.ts` 始终表示该根
+K 线的**收盘时刻**，而不是任意上游数据源的原始标签。例如，结束于
+`10:00` 的 15 分钟 K 线返回 `10:00+08:00`。日线及更高周期保留其规范化的
+交易周期日期。
+
+每个 provider 都必须在适配边界显式声明上游分钟线标签是开盘还是收盘；开盘
+标签会在进入 Hub 契约前转换为收盘时刻。调用方不需要、也不应根据数据源再
+自行加上周期。
+
+> **0.5.1 迁移说明：** 分钟 K 线时间语义现由 Hub 明确保证。自定义 provider
+> 若复用内部 DataFrame 解析器，必须声明其 `intraday_timestamp_label`；远端 Hub
+> 节点则应返回同一收盘时间契约。
+
 PyTDX 只在显式给出行情服务器时启用：
 
 ```python
@@ -175,10 +190,10 @@ JSON 浮点误差；时间使用 ISO 8601 格式。自动化调用应保留并�
 仓库自带生产镜像，默认安装 HTTP 服务和全部免费数据源：
 
 ```powershell
-docker build -t stock-data-hub:0.5.0 .
+docker build -t stock-data-hub:0.5.1 .
 docker run --rm -p 127.0.0.1:18767:8000 `
   -e STOCK_DATA_HUB_API_KEY=replace-with-a-long-random-secret `
-  stock-data-hub:0.5.0
+  stock-data-hub:0.5.1
 ```
 
 容器以非 root 用户运行。正式部署应把镜像推送到私有或可信镜像仓库，并固定版本，

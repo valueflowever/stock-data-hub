@@ -25,12 +25,16 @@ from stock_data_hub.models import (
 )
 from stock_data_hub.normalization import BEIJING_TZ, asset_type_from_symbol
 from stock_data_hub.providers._parsing import (
+    IntradayTimestampLabel,
     bars_from_dataframe,
     decimal_or_none,
     record_value,
     required_positive_decimal,
 )
 from stock_data_hub.providers.base import MarketDataProvider
+
+
+_EASTMONEY_INTRADAY_TIMESTAMP_LABEL = IntradayTimestampLabel.CLOSE
 
 
 class EFinanceProvider(MarketDataProvider):
@@ -80,6 +84,7 @@ class EFinanceProvider(MarketDataProvider):
                 end=end,
                 market=Market.CN,
                 time_columns=("日期", "date"),
+                intraday_timestamp_label=_EASTMONEY_INTRADAY_TIMESTAMP_LABEL,
             ),
             source="efinance:eastmoney",
         )

@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
+from enum import Enum
 from typing import Any
 
 import pandas as pd
@@ -12,6 +13,19 @@ import pandas as pd
 from stock_data_hub.errors import DataValidationError
 from stock_data_hub.models import AShareBar, Interval, Market
 from stock_data_hub.normalization import BEIJING_TZ, is_bar_closed, to_beijing
+
+
+class IntradayTimestampLabel(str, Enum):
+    """Meaning of the raw timestamp supplied by an intraday provider."""
+
+    OPEN = "open"
+    CLOSE = "close"
+
+
+_INTRADAY_DURATIONS = {
+    Interval.MINUTE_15: timedelta(minutes=15),
+    Interval.HOUR_1: timedelta(hours=1),
+}
 
 
 def bars_from_dataframe(
@@ -29,8 +43,15 @@ def bars_from_dataframe(
     close_columns: Sequence[str] = ("close", "收盘"),
     volume_columns: Sequence[str] = ("volume", "vol", "成交量"),
     amount_columns: Sequence[str] = ("amount", "成交额"),
+    intraday_timestamp_label: IntradayTimestampLabel | None = None,
+    now: datetime | None = None,
 ) -> list[AShareBar]:
-    """Normalize a provider dataframe into validated, chronologically sorted bars."""
+    """Normalize a provider dataframe into validated, chronologically sorted bars.
+
+    The public Hub contract uses a bar-close timestamp for intraday data.
+    Every intraday adapter must therefore declare whether its raw source label
+    denotes the bar open or close before data enters the shared contract.
+    """
 
     if dataframe is None or dataframe.empty:
         return []
@@ -38,7 +59,12 @@ def bars_from_dataframe(
     end_bj = to_beijing(end)
     bars: list[AShareBar] = []
     for _, row in dataframe.iterrows():
-        timestamp = to_datetime(record_value(row, *time_columns))
+        raw_timestamp = to_datetime(record_value(row, *time_columns))
+        timestamp = normalize_bar_timestamp(
+            raw_timestamp,
+            interval,
+            intraday_timestamp_label=intraday_timestamp_label,
+        )
         if timestamp is None or timestamp < start_bj or timestamp > end_bj:
             continue
         try:
@@ -67,11 +93,38 @@ def bars_from_dataframe(
                 close=close_price,
                 volume=volume,
                 amount=amount,
-                is_closed=is_bar_closed(timestamp, interval, market=market),
+                is_closed=is_bar_closed(timestamp, interval, now=now, market=market),
                 market=market,
             )
         )
     return sorted(bars, key=lambda item: item.ts)
+
+
+def normalize_bar_timestamp(
+    value: datetime | None,
+    interval: Interval,
+    *,
+    intraday_timestamp_label: IntradayTimestampLabel | None,
+) -> datetime | None:
+    """Return the Hub's canonical bar timestamp from a provider label."""
+
+    if value is None:
+        return None
+    timestamp = to_beijing(value)
+    duration = _INTRADAY_DURATIONS.get(interval)
+    if duration is None:
+        return timestamp
+    if intraday_timestamp_label is None:
+        raise ValueError(
+            f"{interval.value} bars require an explicit intraday_timestamp_label"
+        )
+    if intraday_timestamp_label is IntradayTimestampLabel.CLOSE:
+        return timestamp
+    if intraday_timestamp_label is IntradayTimestampLabel.OPEN:
+        return timestamp + duration
+    raise ValueError(
+        f"Unsupported intraday timestamp label: {intraday_timestamp_label!r}"
+    )
 
 
 def record_value(record: Any, *names: str) -> object | None:
