@@ -135,6 +135,18 @@ client = create_default_hub(pytdx_host="119.147.212.81", pytdx_port=7709)
 stock-data-hub serve --host 127.0.0.1 --port 8000
 ```
 
+部署环境应设置服务密钥；设置后，所有数据与健康检查请求都必须携带
+`X-Data-Hub-Key`：
+
+```powershell
+$env:STOCK_DATA_HUB_API_KEY = "replace-with-a-long-random-secret"
+stock-data-hub serve --host 0.0.0.0 --port 8000
+curl -Headers @{ "X-Data-Hub-Key" = $env:STOCK_DATA_HUB_API_KEY } `
+  http://127.0.0.1:8000/health
+```
+
+密钥为空时保持无鉴权模式，仅适合回环地址或受控的容器内网。
+
 - OpenAPI 文档：`http://127.0.0.1:8000/docs`
 - OpenAPI JSON：`http://127.0.0.1:8000/openapi.json`
 
@@ -158,6 +170,20 @@ curl "http://127.0.0.1:8000/bars/AAPL?market=US&interval=1d&start=2026-06-01T00:
 JSON 浮点误差；时间使用 ISO 8601 格式。自动化调用应保留并判断
 `metadata.source`、`metadata.stale` 与 `metadata.cache_hit`。
 
+### Docker 镜像
+
+仓库自带生产镜像，默认安装 HTTP 服务和全部免费数据源：
+
+```powershell
+docker build -t stock-data-hub:0.5.0 .
+docker run --rm -p 127.0.0.1:18767:8000 `
+  -e STOCK_DATA_HUB_API_KEY=replace-with-a-long-random-secret `
+  stock-data-hub:0.5.0
+```
+
+容器以非 root 用户运行。正式部署应把镜像推送到私有或可信镜像仓库，并固定版本，
+不要让业务项目通过宿主机绝对路径安装源码。
+
 ## 国内与海外部署互备
 
 可在国内、海外分别启动服务，并把另一地区的 URL 配置为本地免费数据源均失败
@@ -171,10 +197,31 @@ stock-data-hub serve --host 0.0.0.0 --port 8000 --peer-url http://overseas-node:
 stock-data-hub serve --host 0.0.0.0 --port 9000 --peer-url http://china-node:8000
 ```
 
+容器部署可完全使用环境变量：
+
+```env
+STOCK_DATA_HUB_API_KEY=<本节点访问密钥>
+STOCK_DATA_HUB_PEER_URLS=https://overseas-hub.internal
+STOCK_DATA_HUB_PEER_API_KEY=<对端节点访问密钥>
+STOCK_DATA_HUB_PYTDX_HOST=
+STOCK_DATA_HUB_SNAPSHOT_TIMEOUT_SECONDS=45
+```
+
+`STOCK_DATA_HUB_PEER_URLS` 支持逗号分隔多个节点。跨公网连接必须使用带鉴权的
+HTTPS，优先放在 WireGuard、Tailscale 或云厂商私网中；不要把无鉴权服务直接暴露
+在公网。
+
+全市场快照需要分页读取数千只股票，默认给每个供应商 45 秒；报价、K 线等接口仍使用
+20 秒预算。网络较慢的区域可以通过 `STOCK_DATA_HUB_SNAPSHOT_TIMEOUT_SECONDS` 单独调整，
+无需放大其他接口的超时。
+
 Python 中等价配置：
 
 ```python
-client = create_default_hub(peer_urls=["http://overseas-node:9000"])
+client = create_default_hub(
+    peer_urls=["http://overseas-node:9000"],
+    peer_api_key="peer-secret",
+)
 ```
 
 本地来源始终优先。跨区域请求会自动避免双向转发循环，返回的来源字段会保留完整

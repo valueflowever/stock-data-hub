@@ -77,6 +77,9 @@ class AkShareProvider(MarketDataProvider):
         }
     )
 
+    def __init__(self, *, prefer_sina_snapshot: bool = False) -> None:
+        self._prefer_sina_snapshot = prefer_sina_snapshot
+
     def supports_request(
         self,
         capability: Capability,
@@ -249,6 +252,23 @@ class AkShareProvider(MarketDataProvider):
 
     def fetch_snapshot(self) -> SourcePayload[Snapshot]:
         ak = _load_akshare()
+        if self._prefer_sina_snapshot:
+            try:
+                return SourcePayload(
+                    value=_parse_snapshot(ak.stock_zh_a_spot(), has_market_cap=False),
+                    source="akshare:sina",
+                )
+            except Exception:  # noqa: BLE001 - an upstream failure triggers fallback
+                try:
+                    return SourcePayload(
+                        value=_parse_snapshot(ak.stock_zh_a_spot_em(), has_market_cap=True),
+                        source="akshare:eastmoney",
+                        warnings=("Sina snapshot was unavailable; used Eastmoney fallback.",),
+                    )
+                except Exception as fallback_error:
+                    raise ProviderUnavailable(
+                        "AkShare could not obtain an A-share market snapshot"
+                    ) from fallback_error
         try:
             return SourcePayload(
                 value=_parse_snapshot(ak.stock_zh_a_spot_em(), has_market_cap=True),

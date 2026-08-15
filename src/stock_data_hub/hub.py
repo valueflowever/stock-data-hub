@@ -106,6 +106,7 @@ class DataHub:
         failure_threshold: int = 2,
         circuit_cooldown: timedelta = timedelta(seconds=30),
         provider_timeout_seconds: float | None = 20.0,
+        provider_timeout_overrides: Mapping[Capability | str, float | None] | None = None,
         max_concurrent_requests: int = 8,
     ) -> None:
         if attempts_per_provider < 1:
@@ -114,6 +115,12 @@ class DataHub:
             raise ValueError("retry_delay_seconds cannot be negative")
         if provider_timeout_seconds is not None and provider_timeout_seconds <= 0:
             raise ValueError("provider_timeout_seconds must be positive or None")
+        normalized_timeout_overrides: dict[Capability, float | None] = {}
+        for raw_capability, timeout_seconds in (provider_timeout_overrides or {}).items():
+            capability = Capability(raw_capability)
+            if timeout_seconds is not None and timeout_seconds <= 0:
+                raise ValueError("provider timeout overrides must be positive or None")
+            normalized_timeout_overrides[capability] = timeout_seconds
         if max_concurrent_requests < 1:
             raise ValueError("max_concurrent_requests must be at least one")
 
@@ -124,6 +131,7 @@ class DataHub:
         self._attempts_per_provider = attempts_per_provider
         self._retry_delay_seconds = retry_delay_seconds
         self._provider_timeout_seconds = provider_timeout_seconds
+        self._provider_timeout_overrides = normalized_timeout_overrides
         # A thread-safe semaphore keeps a busy upstream from creating an
         # unbounded number of blocking SDK calls, even if this hub is used by
         # more than one event loop.
@@ -391,6 +399,7 @@ class DataHub:
                 provider,
                 invoke,
                 health_route,
+                capability,
             )
             if error is None and payload is not None:
                 source = payload.source or provider.name
@@ -459,13 +468,18 @@ class DataHub:
         provider: MarketDataProvider,
         invoke: Callable[[MarketDataProvider], SourcePayload[T]],
         health_route: str,
+        capability: Capability,
     ) -> tuple[SourcePayload[T] | None, float, Exception | None]:
         last_error: Exception | None = None
         total_latency_ms = 0.0
+        timeout_seconds = self._provider_timeout_overrides.get(
+            capability,
+            self._provider_timeout_seconds,
+        )
         for attempt in range(self._attempts_per_provider):
             started_at = perf_counter()
             try:
-                payload = await self._invoke_provider(provider, invoke)
+                payload = await self._invoke_provider(provider, invoke, timeout_seconds)
                 latency_ms = (perf_counter() - started_at) * 1000
                 total_latency_ms += latency_ms
                 if not isinstance(payload, SourcePayload):
@@ -482,7 +496,7 @@ class DataHub:
             except asyncio.TimeoutError:
                 total_latency_ms += (perf_counter() - started_at) * 1000
                 last_error = ProviderUnavailable(
-                    f"{provider.name} timed out after {self._provider_timeout_seconds} seconds"
+                    f"{provider.name} timed out after {timeout_seconds} seconds"
                 )
                 # Python cannot safely cancel a running SDK thread. Starting
                 # another attempt would duplicate the same upstream request.
@@ -503,17 +517,16 @@ class DataHub:
         self,
         provider: MarketDataProvider,
         invoke: Callable[[MarketDataProvider], SourcePayload[T]],
+        timeout_seconds: float | None,
     ) -> SourcePayload[T]:
         cancel_requested = Event()
         task = asyncio.create_task(
             asyncio.to_thread(self._invoke_with_slot, provider, invoke, cancel_requested)
         )
-        if self._provider_timeout_seconds is None:
+        if timeout_seconds is None:
             return await task
         try:
-            return await asyncio.wait_for(
-                asyncio.shield(task), timeout=self._provider_timeout_seconds
-            )
+            return await asyncio.wait_for(asyncio.shield(task), timeout=timeout_seconds)
         except asyncio.CancelledError:
             cancel_requested.set()
             task.add_done_callback(_consume_task_exception)

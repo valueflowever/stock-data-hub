@@ -6,6 +6,8 @@ when another process, language, or AI tool needs to call it over HTTP.
 
 from __future__ import annotations
 
+import os
+import secrets
 from collections.abc import Sequence
 from datetime import date, datetime
 from typing import Any, TypeVar
@@ -33,28 +35,45 @@ from stock_data_hub.serialization import to_jsonable
 T = TypeVar("T", Instrument, SnapshotRow)
 
 
-def create_app(hub: DataHub | None = None) -> Any:
+def create_app(hub: DataHub | None = None, *, api_key: str | None = None) -> Any:
     """Create a small FastAPI application around a hub instance.
 
     Passing a hub is useful for hosts that configure alternate providers.  If
-    omitted, the service uses the built-in AkShare provider.
+    omitted, the service uses the default provider composition. Set ``api_key``
+    or ``STOCK_DATA_HUB_API_KEY`` to protect every data and health endpoint.
     """
 
     try:
-        from fastapi import FastAPI, Header, Query
+        from fastapi import Depends, FastAPI, Header, HTTPException, Query, Security
         from fastapi.responses import JSONResponse
+        from fastapi.security import APIKeyHeader
     except ModuleNotFoundError as exc:
         raise RuntimeError(
             "HTTP service support is optional. Install stock-data-hub[service]."
         ) from exc
 
     data_hub = hub or create_default_hub()
+    configured_api_key = _clean_secret(
+        api_key if api_key is not None else os.getenv("STOCK_DATA_HUB_API_KEY")
+    )
+    api_key_header = APIKeyHeader(name="X-Data-Hub-Key", auto_error=False)
+
+    async def require_api_key(
+        provided: str | None = Security(api_key_header),
+    ) -> None:
+        if configured_api_key is None:
+            return
+        if provided is None or not secrets.compare_digest(provided, configured_api_key):
+            raise HTTPException(status_code=401, detail="Missing or invalid data hub key")
+
     app = FastAPI(
         title="Stock Data Hub",
-        version="0.4.0",
+        version="0.5.0",
         description="Provider-neutral market-data access with source and cache metadata.",
+        dependencies=[Depends(require_api_key)],
     )
     app.state.data_hub = data_hub
+    app.state.api_key_required = configured_api_key is not None
 
     @app.exception_handler(DataHubError)
     async def handle_data_hub_error(_: Any, exc: DataHubError) -> Any:
@@ -245,3 +264,8 @@ def _page(
         if not query or query in item.symbol.casefold() or query in item.name.casefold()
     )
     return filtered[offset : offset + limit], len(filtered)
+
+
+def _clean_secret(value: str | None) -> str | None:
+    cleaned = str(value or "").strip()
+    return cleaned or None

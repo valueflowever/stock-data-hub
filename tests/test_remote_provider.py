@@ -82,6 +82,7 @@ def test_remote_provider_parses_bars_and_preserves_peer_metadata() -> None:
         "https://overseas.example/",
         name="overseas",
         timeout_seconds=7,
+        api_key="peer-secret",
         opener=opener,
     )
     result = provider.fetch_bars(
@@ -104,6 +105,7 @@ def test_remote_provider_parses_bars_and_preserves_peer_metadata() -> None:
     assert query["adjust"] == ["qfq"]
     assert timeout == 7
     assert headers["x-data-hub-hop"] == "1"
+    assert headers["x-data-hub-key"] == "peer-secret"
 
 
 def test_remote_provider_parses_delayed_quote() -> None:

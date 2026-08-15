@@ -97,29 +97,29 @@ def test_daily_bar_is_closed_after_a_share_close() -> None:
     assert is_bar_closed(bar_time, Interval.DAY_1, after_close)
 
 
-def test_intraday_bar_is_closed_only_after_its_interval() -> None:
+def test_intraday_bar_timestamp_marks_its_close() -> None:
     fifteen_minute_bar = datetime(2026, 7, 17, 10, 0, tzinfo=BEIJING_TZ)
     hourly_bar = datetime(2026, 7, 17, 10, 0, tzinfo=BEIJING_TZ)
 
     assert not is_bar_closed(
         fifteen_minute_bar,
         Interval.MINUTE_15,
-        datetime(2026, 7, 17, 10, 14, tzinfo=BEIJING_TZ),
+        datetime(2026, 7, 17, 9, 59, tzinfo=BEIJING_TZ),
     )
     assert is_bar_closed(
         fifteen_minute_bar,
         Interval.MINUTE_15,
-        datetime(2026, 7, 17, 10, 15, tzinfo=BEIJING_TZ),
+        datetime(2026, 7, 17, 10, 0, tzinfo=BEIJING_TZ),
     )
     assert not is_bar_closed(
         hourly_bar,
         Interval.HOUR_1,
-        datetime(2026, 7, 17, 10, 59, tzinfo=BEIJING_TZ),
+        datetime(2026, 7, 17, 9, 59, tzinfo=BEIJING_TZ),
     )
     assert is_bar_closed(
         hourly_bar,
         Interval.HOUR_1,
-        datetime(2026, 7, 17, 11, 0, tzinfo=BEIJING_TZ),
+        datetime(2026, 7, 17, 10, 0, tzinfo=BEIJING_TZ),
     )
 
 

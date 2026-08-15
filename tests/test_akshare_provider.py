@@ -10,6 +10,31 @@ from stock_data_hub.normalization import BEIJING_TZ
 from stock_data_hub.providers._parsing import decimal_or_none
 
 
+def test_snapshot_can_prefer_sina_as_an_independent_fallback(monkeypatch) -> None:
+    class AkShare:
+        def stock_zh_a_spot(self) -> pd.DataFrame:
+            return pd.DataFrame(
+                {
+                    "代码": ["sh600519"],
+                    "名称": ["贵州茅台"],
+                    "最新价": [1400],
+                    "成交额": [1_000_000_000],
+                    "涨跌幅": [1.2],
+                }
+            )
+
+        def stock_zh_a_spot_em(self) -> pd.DataFrame:
+            raise AssertionError("Eastmoney should not run after Sina succeeds")
+
+    monkeypatch.setattr(adapter, "_load_akshare", lambda: AkShare())
+
+    result = adapter.AkShareProvider(prefer_sina_snapshot=True).fetch_snapshot()
+
+    assert result.source == "akshare:sina"
+    assert result.value.rows[0].symbol == "600519.SH"
+    assert result.value.has_market_cap is False
+
+
 def test_empty_eastmoney_bars_are_a_valid_empty_result(monkeypatch) -> None:
     class EmptyBarsAkShare:
         def stock_zh_a_hist(self, **_: object) -> pd.DataFrame:

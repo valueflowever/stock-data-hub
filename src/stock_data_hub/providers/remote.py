@@ -54,6 +54,7 @@ class RemoteHubProvider(MarketDataProvider):
         timeout_seconds: float = 15.0,
         use_environment_proxy: bool = False,
         max_response_bytes: int = 32 * 1024 * 1024,
+        api_key: str | None = None,
         opener: Callable[..., Any] | None = None,
     ) -> None:
         normalized_url = str(base_url).strip().rstrip("/")
@@ -72,6 +73,7 @@ class RemoteHubProvider(MarketDataProvider):
         self.name = name or f"remote:{normalized_url}"
         self.timeout_seconds = timeout_seconds
         self.max_response_bytes = max_response_bytes
+        self.api_key = str(api_key or "").strip() or None
         if opener is not None:
             self._opener = opener
         elif use_environment_proxy:
@@ -290,11 +292,10 @@ class RemoteHubProvider(MarketDataProvider):
     def _get(self, path: str, params: Mapping[str, object | None]) -> Mapping[str, Any]:
         query = urlencode({key: value for key, value in params.items() if value is not None})
         url = f"{self.base_url}{path}?{query}" if query else f"{self.base_url}{path}"
-        request = Request(
-            url,
-            headers={"Accept": "application/json", "X-Data-Hub-Hop": "1"},
-            method="GET",
-        )
+        headers = {"Accept": "application/json", "X-Data-Hub-Hop": "1"}
+        if self.api_key is not None:
+            headers["X-Data-Hub-Key"] = self.api_key
+        request = Request(url, headers=headers, method="GET")
         try:
             with self._opener(request, timeout=self.timeout_seconds) as response:
                 raw = response.read(self.max_response_bytes + 1)

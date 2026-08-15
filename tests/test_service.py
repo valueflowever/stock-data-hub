@@ -48,6 +48,34 @@ def test_quote_service_returns_json_safe_result_and_metadata() -> None:
     assert payload["metadata"]["stale"] is False
 
 
+def test_service_api_key_protects_health_and_data_routes() -> None:
+    app = create_app(
+        DataHub([ServiceQuoteProvider()], attempts_per_provider=1),
+        api_key="service-secret",
+    )
+    client = TestClient(app)
+
+    missing = client.get("/health")
+    invalid = client.get("/quote/600519", headers={"X-Data-Hub-Key": "wrong"})
+    allowed = client.get(
+        "/quote/600519",
+        headers={"X-Data-Hub-Key": "service-secret"},
+    )
+
+    assert missing.status_code == 401
+    assert invalid.status_code == 401
+    assert allowed.status_code == 200
+
+
+def test_blank_service_api_key_keeps_local_development_open() -> None:
+    app = create_app(
+        DataHub([ServiceQuoteProvider()], attempts_per_provider=1),
+        api_key="  ",
+    )
+
+    assert TestClient(app).get("/health").status_code == 200
+
+
 def test_service_exposes_all_hub_capabilities_as_routes() -> None:
     app = create_app(DataHub([ServiceQuoteProvider()], attempts_per_provider=1))
     paths = {route.path for route in app.routes}

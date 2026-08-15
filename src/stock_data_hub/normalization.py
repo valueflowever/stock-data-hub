@@ -197,7 +197,7 @@ def is_bar_closed(
     now: datetime | None = None,
     market: Market = Market.CN,
 ) -> bool:
-    """Return whether a bar whose timestamp marks its opening is complete."""
+    """Return whether a bar whose timestamp marks its close is complete."""
 
     timestamp = to_beijing(value)
     reference = to_beijing(now or datetime.now(tz=BEIJING_TZ))
@@ -222,8 +222,6 @@ def is_bar_closed(
         else:
             next_month = timestamp.replace(month=timestamp.month + 1, day=1)
         return next_month <= reference
-    duration = {
-        Interval.MINUTE_15: timedelta(minutes=15),
-        Interval.HOUR_1: timedelta(hours=1),
-    }[interval]
-    return timestamp + duration <= reference
+    if interval not in {Interval.MINUTE_15, Interval.HOUR_1}:
+        raise ValueError(f"Unsupported interval: {interval}")
+    return timestamp <= reference

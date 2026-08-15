@@ -22,6 +22,8 @@ def create_default_hub(
     pytdx_host: str | None = None,
     pytdx_port: int = 7709,
     peer_urls: Iterable[str] = (),
+    peer_api_key: str | None = None,
+    snapshot_timeout_seconds: float = 45.0,
 ) -> DataHub:
     """Build a credential-free hub from the installed provider packages.
 
@@ -32,19 +34,32 @@ def create_default_hub(
     providers: list[MarketDataProvider] = []
     if _installed("tickflow"):
         providers.append(TickFlowProvider())
-    if _installed("efinance"):
+    efinance_installed = _installed("efinance")
+    if efinance_installed:
         providers.append(EFinanceProvider())
     if pytdx_host and _installed("pytdx"):
         providers.append(PyTDXProvider(pytdx_host, pytdx_port))
-    providers.append(AkShareProvider())
+    # EFinance already covers Eastmoney. Use Sina first in the AkShare fallback
+    # so a regional Eastmoney outage is not paid for twice on the same route.
+    providers.append(AkShareProvider(prefer_sina_snapshot=efinance_installed))
     if _installed("baostock"):
         providers.append(BaoStockProvider())
     if _installed("yfinance"):
         providers.append(YFinanceProvider())
     normalized_peer_urls = (peer_urls,) if isinstance(peer_urls, str) else peer_urls
     for index, peer_url in enumerate(normalized_peer_urls, start=1):
-        providers.append(RemoteHubProvider(peer_url, name=f"remote-{index}"))
-    return DataHub(providers, source_priority=_DEFAULT_PRIORITY)
+        providers.append(
+            RemoteHubProvider(
+                peer_url,
+                name=f"remote-{index}",
+                api_key=peer_api_key,
+            )
+        )
+    return DataHub(
+        providers,
+        source_priority=_DEFAULT_PRIORITY,
+        provider_timeout_overrides={Capability.SNAPSHOT: snapshot_timeout_seconds},
+    )
 
 
 def _installed(package: str) -> bool:

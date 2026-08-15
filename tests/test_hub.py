@@ -233,6 +233,25 @@ def test_hub_times_out_a_stuck_provider() -> None:
     assert "timed out" in raised.value.errors["slow"]
 
 
+def test_capability_timeout_override_takes_precedence() -> None:
+    provider = SlowQuoteProvider("slow", "slow:quote")
+    hub = DataHub(
+        [provider],
+        attempts_per_provider=1,
+        provider_timeout_seconds=0.01,
+        provider_timeout_overrides={Capability.QUOTE: 0.2},
+    )
+
+    result = asyncio.run(hub.get_quote("600519"))
+
+    assert result.metadata.source == "slow:quote"
+
+
+def test_capability_timeout_override_must_be_positive() -> None:
+    with pytest.raises(ValueError, match="timeout overrides"):
+        DataHub(provider_timeout_overrides={Capability.SNAPSHOT: 0})
+
+
 def test_hub_does_not_retry_a_timed_out_sdk_thread() -> None:
     provider = SlowQuoteProvider("slow", "slow:quote")
     hub = DataHub(

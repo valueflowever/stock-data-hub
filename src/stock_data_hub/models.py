@@ -68,7 +68,8 @@ class AShareBar:
 
     The historical ``AShareBar`` name is retained for compatibility; the hub
     now also uses this contract for Hong Kong and US bars.  ``market`` tells
-    callers which normalized symbol convention applies.
+    callers which normalized symbol convention applies.  ``ts`` is the bar's
+    close timestamp for intraday data and its trading date for daily data.
     """
 
     symbol: str
