@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "stock-data-hub"
-version = "0.5.1"
+version = "0.6.0"
 description = "Region-aware, multi-source stock market data with automatic fallback."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -21,6 +21,9 @@ dev = [
 service = [
     "fastapi>=0.110.0",
     "uvicorn>=0.27.0",
+]
+indicators = [
+    "TA-Lib>=0.6.5,<0.8",
 ]
 sources = [
     "tickflow[all]",

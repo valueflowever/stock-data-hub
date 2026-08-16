@@ -15,7 +15,7 @@ RUN apt-get update \
 COPY pyproject.toml README.md ./
 COPY src ./src
 
-RUN python -m pip install --retries 5 --timeout 120 ".[service,sources]"
+RUN python -m pip install --retries 5 --timeout 120 ".[service,sources,indicators]"
 
 RUN useradd --create-home --shell /usr/sbin/nologin appuser \
     && site_packages="$(python -c 'import sysconfig; print(sysconfig.get_path("purelib"))')" \

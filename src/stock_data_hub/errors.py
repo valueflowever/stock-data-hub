@@ -31,6 +31,26 @@ class InvalidRequest(DataValidationError):
     """The caller supplied a symbol or routing value that cannot be normalized."""
 
 
+class IndicatorError(DataHubError):
+    """Base class for deterministic indicator-computation failures."""
+
+
+class IndicatorNotFound(IndicatorError):
+    """The requested public indicator ID is not registered."""
+
+
+class InvalidIndicatorRequest(InvalidRequest, IndicatorError):
+    """An indicator specification or computation option is invalid."""
+
+
+class IndicatorBackendUnavailable(IndicatorError):
+    """The optional backend for a registered indicator is not installed."""
+
+
+class IndicatorCalculationError(IndicatorError):
+    """A registered backend could not compute a valid result."""
+
+
 class NoProviderConfigured(DataHubError):
     """No registered provider supports the requested capability."""
 

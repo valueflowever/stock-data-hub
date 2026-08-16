@@ -10,11 +10,13 @@ import os
 import secrets
 from collections.abc import Sequence
 from datetime import date, datetime
-from typing import Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from stock_data_hub.errors import (
     AllSourcesFailed,
     DataHubError,
+    IndicatorBackendUnavailable,
+    IndicatorNotFound,
     InvalidRequest,
     NoProviderConfigured,
     ProviderError,
@@ -34,8 +36,16 @@ from stock_data_hub.serialization import to_jsonable
 
 T = TypeVar("T", Instrument, SnapshotRow)
 
+if TYPE_CHECKING:
+    from stock_data_hub.indicators.engine import IndicatorEngine
 
-def create_app(hub: DataHub | None = None, *, api_key: str | None = None) -> Any:
+
+def create_app(
+    hub: DataHub | None = None,
+    *,
+    api_key: str | None = None,
+    indicator_engine: IndicatorEngine | None = None,
+) -> Any:
     """Create a small FastAPI application around a hub instance.
 
     Passing a hub is useful for hosts that configure alternate providers.  If
@@ -53,6 +63,10 @@ def create_app(hub: DataHub | None = None, *, api_key: str | None = None) -> Any
         ) from exc
 
     data_hub = hub or create_default_hub()
+    if indicator_engine is None:
+        from stock_data_hub.indicators.engine import create_default_indicator_engine
+
+        indicator_engine = create_default_indicator_engine(data_hub)
     configured_api_key = _clean_secret(
         api_key if api_key is not None else os.getenv("STOCK_DATA_HUB_API_KEY")
     )
@@ -68,7 +82,7 @@ def create_app(hub: DataHub | None = None, *, api_key: str | None = None) -> Any
 
     app = FastAPI(
         title="Stock Data Hub",
-        version="0.5.1",
+        version="0.6.0",
         description="Provider-neutral market-data access with source and cache metadata.",
         dependencies=[Depends(require_api_key)],
     )
@@ -77,9 +91,14 @@ def create_app(hub: DataHub | None = None, *, api_key: str | None = None) -> Any
 
     @app.exception_handler(DataHubError)
     async def handle_data_hub_error(_: Any, exc: DataHubError) -> Any:
-        if isinstance(exc, InvalidRequest):
+        if isinstance(exc, IndicatorNotFound):
+            status_code = 404
+        elif isinstance(exc, InvalidRequest):
             status_code = 422
-        elif isinstance(exc, (AllSourcesFailed, NoProviderConfigured)):
+        elif isinstance(
+            exc,
+            (AllSourcesFailed, IndicatorBackendUnavailable, NoProviderConfigured),
+        ):
             status_code = 503
         elif isinstance(exc, ProviderError):
             status_code = 502
@@ -241,6 +260,10 @@ def create_app(hub: DataHub | None = None, *, api_key: str | None = None) -> Any
             )
         )
 
+    from stock_data_hub.indicator_service import register_indicator_routes
+
+    app.state.indicator_engine = indicator_engine
+    register_indicator_routes(app, indicator_engine)
     return app
 
 

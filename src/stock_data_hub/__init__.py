@@ -1,6 +1,15 @@
 """Standalone, source-agnostic market data access layer."""
 
 from stock_data_hub.hub import CachePolicy, DataHub
+from stock_data_hub.indicators import (
+    FactorFrame,
+    IndicatorDefinition,
+    IndicatorEngine,
+    IndicatorRegistry,
+    IndicatorResult,
+    IndicatorSpec,
+    create_default_indicator_engine,
+)
 from stock_data_hub.models import (
     Adjust,
     AShareBar,
@@ -49,7 +58,13 @@ __all__ = [
     "DataResult",
     "Disclosure",
     "EFinanceProvider",
+    "FactorFrame",
     "FetchMetadata",
+    "IndicatorDefinition",
+    "IndicatorEngine",
+    "IndicatorRegistry",
+    "IndicatorResult",
+    "IndicatorSpec",
     "Instrument",
     "Interval",
     "Market",
@@ -66,5 +81,6 @@ __all__ = [
     "YFinanceProvider",
     "create_app",
     "create_default_hub",
+    "create_default_indicator_engine",
     "to_jsonable",
 ]

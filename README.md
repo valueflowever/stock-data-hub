@@ -16,6 +16,7 @@
 | 市场 | A 股、港股、美股 |
 | 标的 | 股票、A 股 ETF、指数；全球市场可显式指定 ETF |
 | 行情 | 日 / 周 / 月 K 线、报价、A 股全市场快照 |
+| 派生数据 | 稳定技术指标目录、单标的多指标计算、可复现 factor frame |
 | 参考与公司数据 | 标的列表、交易日历、公司资料、公告、限售解禁 |
 | 美股补充数据 | 日线收盘价 |
 
@@ -61,14 +62,14 @@ pip install -e .
 ```powershell
 python -m venv .venv
 .venv\Scripts\Activate.ps1
-pip install -e ".[dev,service,sources]"
+pip install -e ".[dev,service,sources,indicators]"
 ```
 
 Linux 或 macOS：
 
 ```bash
 source .venv/bin/activate
-pip install -e ".[dev,service,sources]"
+pip install -e ".[dev,service,sources,indicators]"
 ```
 
 ## Python 快速开始
@@ -142,6 +143,65 @@ PyTDX 只在显式给出行情服务器时启用：
 client = create_default_hub(pytdx_host="119.147.212.81", pytdx_port=7709)
 ```
 
+## 技术指标与 factor frame
+
+指标能力是可选依赖，不会扩大只使用行情 Hub 时的安装面：
+
+```powershell
+pip install -e ".[indicators]"
+```
+
+当前稳定目录包含 SMA、EMA、Wilder RSI、MACD、Bollinger Bands、Wilder ATR、
+Stochastic、ADX/DMI、ROC 和 OBV。公共指标 ID、参数、输出和公式变体由项目目录
+固定，不会根据本机安装的第三方库动态变化。
+
+一次请求会先取得一份规范化 K 线，再计算多个指标：
+
+```python
+from stock_data_hub import (
+    Adjust,
+    IndicatorSpec,
+    Interval,
+    create_default_hub,
+    create_default_indicator_engine,
+)
+
+hub = create_default_hub()
+indicators = create_default_indicator_engine(hub)
+result = await indicators.calculate(
+    "600519",
+    Interval.DAY_1,
+    start,
+    end,
+    [
+        IndicatorSpec("momentum.rsi", {"period": 14}, alias="rsi14"),
+        IndicatorSpec("trend.macd", alias="macd"),
+        IndicatorSpec("volatility.atr", {"period": 14}, alias="atr14"),
+    ],
+    adjust=Adjust.QFQ,
+)
+factor_frame = result.value.to_pandas()
+print(factor_frame[["close", "rsi14", "macd.histogram", "atr14"]].tail())
+```
+
+计算契约：
+
+- 默认只使用 `is_closed=True` 的 K 线，并按每个指标的精确 lookback 自动向前补数。
+- 结果只返回请求区间；HTTP 缺失值为 `null`，不补零、不前向填充。
+- 同一请求中的多个指标共用一次取数，但各自使用独立 warm-up，因此加入长周期指标
+  不会改变已有短周期指标值。
+- `metadata.computation` 记录目录/后端版本、实际计算起点、warm-up 行数和输入 SHA-256，
+  原有 `source`、`stale`、`cache_hit` 继续描述底层行情。
+- EMA、RSI、MACD、OBV 等路径相关指标应一次计算完整回测区间，不要拼接多个短窗口。
+  OBV 的稳定变体为 `window-seeded`，绝对值以本次计算窗口起点为基准。
+- QFQ 历史可能在后续公司行为发生后被重算，不等同于 point-in-time 数据；响应会携带
+  `adjustment_as_of` 和显式警告。
+- 默认单次最多 32 个指标、100,000 根输入 K 线和 2,000,000 个输出单元；指标计算使用
+  独立的受限线程槽，不占用行情 provider 的并发预算。
+
+指标值在该根 K 线收盘后才可用。回测使用者应默认在下一根 K 线执行信号，避免用
+当前收盘指标在同一收盘价成交。
+
 ## HTTP / OpenAPI 服务
 
 安装 `service` extra 后可启动本地只读服务：
@@ -170,6 +230,7 @@ curl -Headers @{ "X-Data-Hub-Key" = $env:STOCK_DATA_HUB_API_KEY } `
 | 能力 | HTTP 路径 |
 | --- | --- |
 | 报价、K 线、全市场快照 | `/quote/{symbol}`、`/bars/{symbol}`、`/snapshot` |
+| 指标目录、单标的多指标 | `GET /indicators`、`POST /indicator-computations` |
 | 标的与交易日历 | `/instruments`、`/trade-calendar` |
 | 公司资料、公告、限售解禁 | `/company-profile/{symbol}`、`/disclosures/{symbol}`、`/restricted-releases/{symbol}` |
 | 美股日线收盘价、运行状态 | `/us-daily-closes/{ticker}`、`/health` |
@@ -181,6 +242,28 @@ curl http://127.0.0.1:8000/quote/600519
 curl "http://127.0.0.1:8000/bars/AAPL?market=US&interval=1d&start=2026-06-01T00:00:00%2B08:00&end=2026-06-30T23:59:00%2B08:00"
 ```
 
+多指标计算使用 JSON 请求体，并要求显式指定复权方式：
+
+```json
+{
+  "symbol": "600519",
+  "interval": "1d",
+  "start": "2025-01-01T00:00:00+08:00",
+  "end": "2026-01-01T00:00:00+08:00",
+  "adjust": "qfq",
+  "closed_only": true,
+  "indicators": [
+    {"id": "momentum.rsi", "alias": "rsi14", "params": {"period": 14}},
+    {"id": "trend.macd", "alias": "macd", "params": {}}
+  ]
+}
+```
+
+factor frame 的 `rows` 使用平铺结构，例如 `ts`、OHLCV、`rsi14`、`macd.macd`、
+`macd.signal` 和 `macd.histogram`。金融数值仍以字符串编码，warm-up 或输入不足使用
+`null`。未安装 `indicators` extra 时目录仍可查询，但会标记 `available=false`，计算请求
+返回 503，不影响其他行情接口。
+
 数据接口返回 `{ "data": ..., "metadata": ... }`。金融数值以字符串编码，避免
 JSON 浮点误差；时间使用 ISO 8601 格式。自动化调用应保留并判断
 `metadata.source`、`metadata.stale` 与 `metadata.cache_hit`。
@@ -190,10 +273,10 @@ JSON 浮点误差；时间使用 ISO 8601 格式。自动化调用应保留并�
 仓库自带生产镜像，默认安装 HTTP 服务和全部免费数据源：
 
 ```powershell
-docker build -t stock-data-hub:0.5.1 .
+docker build -t stock-data-hub:0.6.0 .
 docker run --rm -p 127.0.0.1:18767:8000 `
   -e STOCK_DATA_HUB_API_KEY=replace-with-a-long-random-secret `
-  stock-data-hub:0.5.1
+  stock-data-hub:0.6.0
 ```
 
 容器以非 root 用户运行。正式部署应把镜像推送到私有或可信镜像仓库，并固定版本，
