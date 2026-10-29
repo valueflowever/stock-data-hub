@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "stock-data-hub"
-version = "0.6.0"
+version = "0.7.0"
 description = "Region-aware, multi-source stock market data with automatic fallback."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -18,6 +18,8 @@ dependencies = [
 dev = [
     "pytest>=8.0.0",
     "ruff>=0.4.4",
+    "httpx>=0.27,<1",
+    "build>=1.2",
 ]
 service = [
     "fastapi>=0.110.0",
