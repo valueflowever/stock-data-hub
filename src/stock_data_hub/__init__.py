@@ -11,9 +11,11 @@ from stock_data_hub.indicators import (
     create_default_indicator_engine,
 )
 from stock_data_hub.models import (
+    DATA_CONTRACT_VERSION,
     Adjust,
     AShareBar,
     AssetType,
+    BarDataQuality,
     Capability,
     CompanyProfile,
     DailyClose,
@@ -45,11 +47,13 @@ from stock_data_hub.service import create_app
 
 __all__ = [
     "BEIJING_TZ",
+    "DATA_CONTRACT_VERSION",
     "AShareBar",
     "Adjust",
     "AkShareProvider",
     "AssetType",
     "BaoStockProvider",
+    "BarDataQuality",
     "CachePolicy",
     "Capability",
     "CompanyProfile",

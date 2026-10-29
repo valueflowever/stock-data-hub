@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime, time, timedelta
+from datetime import datetime, time
 from zoneinfo import ZoneInfo
 
 from stock_data_hub.errors import InvalidRequest
 from stock_data_hub.models import AssetType, Interval, Market
+from stock_data_hub.trading_sessions import market_timezone, period_close, period_end
 
 BEIJING_TZ = ZoneInfo("Asia/Shanghai")
 A_SHARE_DAILY_CLOSE_TIME = time(15, 5)
@@ -24,13 +25,8 @@ def normalize_a_share_symbol(raw: str) -> str:
     if match is None:
         raise InvalidRequest(f"Invalid A-share symbol: {raw!r}")
     digits = match.group("digits")
-    if digits.startswith(("5", "6", "9")):
-        inferred_suffix = "SH"
-    elif digits.startswith(("4", "8")):
-        inferred_suffix = "BJ"
-    elif digits.startswith(("0", "1", "2", "3")):
-        inferred_suffix = "SZ"
-    else:
+    inferred_suffix = _infer_cn_exchange(digits)
+    if inferred_suffix is None:
         raise InvalidRequest(f"Cannot infer A-share exchange for symbol: {raw!r}")
     prefix = match.group("prefix")
     suffix = match.group("suffix")
@@ -176,10 +172,10 @@ def _normalize_us_symbol(value: str) -> str:
 
 
 def _infer_cn_exchange(code: str) -> str | None:
+    if code.startswith(("4", "8", "920")):
+        return "BJ"
     if code.startswith(("5", "6", "9")):
         return "SH"
-    if code.startswith(("4", "8")):
-        return "BJ"
     if code.startswith(("0", "1", "2", "3")):
         return "SZ"
     return None
@@ -197,31 +193,21 @@ def is_bar_closed(
     now: datetime | None = None,
     market: Market = Market.CN,
 ) -> bool:
-    """Return whether a bar whose timestamp marks its close is complete."""
+    """Use a close instant for intraday bars and an exchange session for date labels."""
 
     timestamp = to_beijing(value)
     reference = to_beijing(now or datetime.now(tz=BEIJING_TZ))
-    if interval == Interval.DAY_1:
-        if market == Market.CN:
-            close_at = datetime.combine(
-                timestamp.date(), A_SHARE_DAILY_CLOSE_TIME, tzinfo=BEIJING_TZ
+    if interval in {Interval.DAY_1, Interval.WEEK_1, Interval.MONTH_1}:
+        try:
+            close_at = period_close(timestamp.date(), interval, market)
+        except (ValueError, OverflowError):
+            # Published holiday tables have finite ranges. Never declare a
+            # current period closed from an assumed regular closing hour.
+            return (
+                period_end(timestamp.date(), interval)
+                < reference.astimezone(market_timezone(market)).date()
             )
-            return close_at <= reference
-        return timestamp.date() < reference.date()
-    if interval == Interval.WEEK_1:
-        week_end = timestamp + timedelta(days=4 - timestamp.weekday())
-        if market == Market.CN:
-            close_at = datetime.combine(
-                week_end.date(), A_SHARE_DAILY_CLOSE_TIME, tzinfo=BEIJING_TZ
-            )
-            return close_at <= reference
-        return week_end.date() < reference.date()
-    if interval == Interval.MONTH_1:
-        if timestamp.month == 12:
-            next_month = timestamp.replace(year=timestamp.year + 1, month=1, day=1)
-        else:
-            next_month = timestamp.replace(month=timestamp.month + 1, day=1)
-        return next_month <= reference
+        return close_at is not None and close_at <= reference
     if interval not in {Interval.MINUTE_15, Interval.HOUR_1}:
         raise ValueError(f"Unsupported interval: {interval}")
     return timestamp <= reference

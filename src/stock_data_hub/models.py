@@ -13,6 +13,8 @@ from decimal import Decimal
 from enum import Enum
 from typing import Generic, TypeVar
 
+DATA_CONTRACT_VERSION = "2.0"
+
 
 class Capability(str, Enum):
     BARS = "bars"
@@ -71,7 +73,10 @@ class AShareBar:
     callers which normalized symbol convention applies. For intraday data,
     ``ts`` is always the canonical close timestamp, normalized at the
     provider boundary rather than copied from an upstream label. For daily
-    and higher intervals, it is the provider's canonical trading-period date.
+    and higher intervals, it is the trading-period date at midnight Beijing
+    time (a date label, not the instant the market opens). Volume is shares
+    or fund units; index volume counts underlying shares. Amount is in the
+    market's currency (CNY, HKD, or USD).
     """
 
     symbol: str
@@ -169,6 +174,23 @@ T = TypeVar("T")
 
 
 @dataclass(frozen=True)
+class BarDataQuality:
+    requested_start: datetime
+    requested_end: datetime
+    available_start: datetime | None
+    available_end: datetime | None
+    input_rows: int
+    returned_rows: int
+    filtered_rows: int = 0
+    duplicate_rows: int = 0
+    # Unknown without a listing/suspension calendar; never guess missing bars.
+    missing_rows: int | None = None
+    truncated: bool = False
+    volume_unit: str = "shares"
+    currency: str = "CNY"
+
+
+@dataclass(frozen=True)
 class SourcePayload(Generic[T]):
     """A provider response before the hub adds routing metadata.
 
@@ -182,6 +204,9 @@ class SourcePayload(Generic[T]):
     warnings: tuple[str, ...] = ()
     # Peer adapters preserve the remote node's explicit stale-data state.
     stale: bool = False
+    fetched_at: datetime | None = None
+    cache_hit: bool = False
+    quality: BarDataQuality | None = None
 
 
 @dataclass(frozen=True)
@@ -193,6 +218,10 @@ class FetchMetadata:
     cache_hit: bool = False
     stale: bool = False
     warnings: tuple[str, ...] = ()
+    received_at: datetime | None = None
+    age_seconds: float = 0.0
+    quality: BarDataQuality | None = None
+    contract_version: str = DATA_CONTRACT_VERSION
 
 
 @dataclass(frozen=True)
