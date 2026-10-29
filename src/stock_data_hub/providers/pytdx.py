@@ -5,10 +5,13 @@ from __future__ import annotations
 from collections.abc import Callable
 from contextlib import suppress
 from datetime import datetime
+from decimal import Decimal
+from math import isfinite
 from typing import Any
 
 import pandas as pd
 
+from stock_data_hub._workers import remaining_timeout
 from stock_data_hub.errors import DataValidationError, ProviderUnavailable
 from stock_data_hub.models import (
     Adjust,
@@ -19,7 +22,7 @@ from stock_data_hub.models import (
     Market,
     SourcePayload,
 )
-from stock_data_hub.providers._parsing import bars_from_dataframe
+from stock_data_hub.providers._parsing import bar_payload_from_dataframe
 from stock_data_hub.providers.base import MarketDataProvider
 
 
@@ -41,6 +44,7 @@ class PyTDXProvider(MarketDataProvider):
         client_factory: Callable[[], Any] | None = None,
         page_size: int = 800,
         max_rows: int = 12_000,
+        timeout_seconds: float = 10.0,
     ) -> None:
         if not str(host).strip():
             raise ValueError("PyTDX host cannot be empty")
@@ -55,6 +59,9 @@ class PyTDXProvider(MarketDataProvider):
         self._client_factory = client_factory
         self._page_size = page_size
         self._max_rows = max_rows
+        if not isfinite(timeout_seconds) or timeout_seconds <= 0:
+            raise ValueError("PyTDX timeout must be positive")
+        self._timeout_seconds = timeout_seconds
 
     def fetch_bars(
         self,
@@ -72,11 +79,14 @@ class PyTDXProvider(MarketDataProvider):
         client = self._client()
         rows: list[object] = []
         try:
-            connected = client.connect(self.host, self.port)
+            connected = client.connect(
+                self.host, self.port, time_out=remaining_timeout(self._timeout_seconds)
+            )
             if connected is False:
                 raise ProviderUnavailable(f"PyTDX could not connect to {self.host}:{self.port}")
             market = 1 if exchange == "SH" else 0
             for offset in range(0, self._max_rows, self._page_size):
+                remaining_timeout(self._timeout_seconds)
                 page = client.get_security_bars(9, market, code, offset, self._page_size)
                 if not page:
                     break
@@ -97,18 +107,21 @@ class PyTDXProvider(MarketDataProvider):
         dataframe = _to_frame(client, rows)
         if not isinstance(dataframe, pd.DataFrame):
             raise DataValidationError("PyTDX bars response could not be converted to a dataframe")
-        return SourcePayload(
-            value=bars_from_dataframe(
-                dataframe,
-                symbol=symbol,
-                interval=interval,
-                start=start,
-                end=end,
-                market=Market.CN,
-                time_columns=("datetime", "date"),
-                volume_columns=("vol", "volume"),
-            ),
+        return bar_payload_from_dataframe(
+            dataframe,
             source=f"pytdx:{self.host}:{self.port}",
+            symbol=symbol,
+            interval=interval,
+            start=start,
+            end=end,
+            market=Market.CN,
+            time_columns=("datetime", "date"),
+            volume_columns=("vol", "volume"),
+            volume_multiplier=Decimal(100),
+            adjust=adjust,
+            truncated=len(rows) >= self._max_rows
+            and not dataframe.empty
+            and pd.to_datetime(dataframe["datetime"]).min().date() > start.date(),
         )
 
     def _client(self) -> Any:
@@ -120,7 +133,7 @@ class PyTDXProvider(MarketDataProvider):
             raise ProviderUnavailable(
                 "PyTDX is not installed. Install stock-data-hub[sources]."
             ) from exc
-        return TdxHq_API(raise_exception=True, auto_retry=True)
+        return TdxHq_API(raise_exception=True, auto_retry=False)
 
 
 def _to_frame(client: Any, rows: object) -> pd.DataFrame:

@@ -218,3 +218,33 @@ def test_sina_intraday_bars_declare_close_timestamp_labels(monkeypatch) -> None:
     assert result.source == "akshare:sina"
     assert result.value[0].ts == close_time
     assert client.kwargs["period"] == "60"
+
+
+def test_quotes_share_the_snapshot_fetch_and_its_timestamp(monkeypatch) -> None:
+    class AkShare:
+        calls = 0
+
+        def stock_zh_a_spot_em(self):
+            self.calls += 1
+            return pd.DataFrame(
+                {
+                    "代码": ["600519", "600000"],
+                    "名称": ["茅台", "浦发银行"],
+                    "最新价": [1400, 10],
+                    "成交额": [1000000, 2000000],
+                }
+            )
+
+    sdk = AkShare()
+    monkeypatch.setattr(adapter, "_load_akshare", lambda: sdk)
+    provider = adapter.AkShareProvider()
+    first = provider.fetch_quote("600519")
+    second = provider.fetch_quote("600000")
+    snapshot = provider.fetch_snapshot()
+    assert sdk.calls == 1
+    assert first.fetched_at == second.fetched_at == snapshot.fetched_at
+    assert second.cache_hit and snapshot.cache_hit
+    assert first.value.ts == snapshot.value.fetched_at
+    provider.clear_cache()
+    provider.fetch_quote("600519")
+    assert sdk.calls == 2

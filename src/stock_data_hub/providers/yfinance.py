@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from datetime import datetime, timedelta
+from math import isfinite
 from typing import Any
 
 import pandas as pd
 
+from stock_data_hub._workers import remaining_timeout
 from stock_data_hub.errors import DataValidationError, ProviderUnavailable
 from stock_data_hub.models import (
     Adjust,
@@ -23,7 +25,7 @@ from stock_data_hub.models import (
 )
 from stock_data_hub.normalization import BEIJING_TZ, market_from_symbol
 from stock_data_hub.providers._parsing import (
-    bars_from_dataframe,
+    bar_payload_from_dataframe,
     decimal_or_none,
     record_value,
     required_positive_decimal,
@@ -43,8 +45,13 @@ class YFinanceProvider(MarketDataProvider):
     adjustments = frozenset({Adjust.QFQ, Adjust.NONE})
     accepts_asset_type = True
 
-    def __init__(self, *, ticker_factory: Callable[[str], Any] | None = None) -> None:
+    def __init__(
+        self, *, ticker_factory: Callable[[str], Any] | None = None, timeout_seconds: float = 15.0
+    ) -> None:
         self._ticker_factory = ticker_factory
+        if not isfinite(timeout_seconds) or timeout_seconds <= 0:
+            raise ValueError("Yahoo timeout must be positive")
+        self._timeout_seconds = timeout_seconds
 
     def fetch_bars(
         self,
@@ -68,14 +75,17 @@ class YFinanceProvider(MarketDataProvider):
                 actions=False,
                 repair=True,
                 raise_errors=True,
+                timeout=remaining_timeout(self._timeout_seconds),
             )
         except Exception as exc:
             raise ProviderUnavailable(f"YFinance could not obtain bars for {symbol}") from exc
         if not isinstance(dataframe, pd.DataFrame):
             raise DataValidationError("YFinance bars response was not a dataframe")
         frame = dataframe.reset_index()
-        bars = bars_from_dataframe(
+        return bar_payload_from_dataframe(
             frame,
+            source="yfinance:yahoo",
+            warnings=("Yahoo quotes and the newest bar may be delayed.",),
             symbol=symbol,
             interval=interval,
             start=start,
@@ -88,11 +98,7 @@ class YFinanceProvider(MarketDataProvider):
             close_columns=("Close", "close"),
             volume_columns=("Volume", "volume"),
             amount_columns=(),
-        )
-        return SourcePayload(
-            value=bars,
-            source="yfinance:yahoo",
-            warnings=("Yahoo quotes and the newest bar may be delayed.",),
+            adjust=adjust,
         )
 
     def fetch_quote(
@@ -131,6 +137,7 @@ class YFinanceProvider(MarketDataProvider):
                 actions=False,
                 repair=True,
                 raise_errors=True,
+                timeout=remaining_timeout(self._timeout_seconds),
             )
         except Exception as exc:
             raise ProviderUnavailable(
@@ -168,7 +175,7 @@ class YFinanceProvider(MarketDataProvider):
 def _yahoo_symbol(symbol: str) -> str:
     code, exchange = symbol.rsplit(".", maxsplit=1)
     if exchange == "US":
-        return code
+        return code.replace(".", "-")
     if exchange == "HK":
         return f"{code.lstrip('0').zfill(4)}.HK"
     if exchange == "SH":

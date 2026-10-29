@@ -21,7 +21,7 @@ from stock_data_hub.models import (
     Market,
     SourcePayload,
 )
-from stock_data_hub.providers._parsing import bars_from_dataframe
+from stock_data_hub.providers._parsing import bar_payload_from_dataframe
 from stock_data_hub.providers.base import MarketDataProvider
 
 
@@ -78,17 +78,16 @@ class BaoStockProvider(MarketDataProvider):
             finally:
                 with suppress(Exception):
                     client.logout()
-        return SourcePayload(
-            value=bars_from_dataframe(
-                dataframe,
-                symbol=symbol,
-                interval=interval,
-                start=start,
-                end=end,
-                market=Market.CN,
-                time_columns=("date",),
-            ),
+        return bar_payload_from_dataframe(
+            dataframe,
             source="baostock",
+            symbol=symbol,
+            interval=interval,
+            start=start,
+            end=end,
+            market=Market.CN,
+            time_columns=("date",),
+            adjust=adjust,
         )
 
     def _client(self) -> Any:

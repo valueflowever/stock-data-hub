@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 import pytest
 
+import stock_data_hub.providers.akshare as ak_adapter
 from stock_data_hub.errors import DataValidationError
 from stock_data_hub.models import Adjust, Interval, Market
 from stock_data_hub.normalization import (
@@ -17,7 +20,13 @@ from stock_data_hub.normalization import (
     normalize_symbol,
 )
 from stock_data_hub.providers._parsing import bar_payload_from_dataframe
+from stock_data_hub.providers.efinance import EFinanceProvider
+from stock_data_hub.providers.tickflow import TickFlowProvider
 from stock_data_hub.providers.yfinance import YFinanceProvider
+
+FIXTURES = json.loads(
+    (Path(__file__).parent / "fixtures" / "provider_bars.json").read_text(encoding="utf-8")
+)
 
 
 @pytest.mark.parametrize("raw", ["920002", "920002.BJ", "BJ920002"])
@@ -26,6 +35,91 @@ def test_new_beijing_codes_preserve_the_exchange(raw):
     assert normalize_a_share_symbol(raw) == "920002.BJ"
     with pytest.raises(DataValidationError):
         normalize_symbol("920002.SH")
+
+
+def test_same_numeric_code_is_routed_to_distinct_eastmoney_ids():
+    calls = []
+
+    class Stock:
+        def get_quote_history(self, code, *, beg, end, klt, fqt, quote_id_mode):
+            assert quote_id_mode
+            calls.append(code)
+            price = 3500 if code == "1.000001" else 10
+            return pd.DataFrame(
+                {
+                    "股票代码": ["000001"],
+                    "date": ["2026-07-17"],
+                    "open": [price],
+                    "high": [price],
+                    "low": [price],
+                    "close": [price],
+                    "volume": [100],
+                }
+            )
+
+        def get_latest_quote(self, ids, *, quote_id_mode):
+            assert quote_id_mode
+            return pd.DataFrame({"行情ID": ids, "最新价": [3500 if ids[0] == "1.000001" else 10]})
+
+    provider = EFinanceProvider(client_loader=lambda: SimpleNamespace(stock=Stock()))
+    day = datetime(2026, 7, 17, tzinfo=BEIJING_TZ)
+    index = provider.fetch_bars("000001.SH", Interval.DAY_1, day, day, Adjust.NONE)
+    stock = provider.fetch_bars("000001.SZ", Interval.DAY_1, day, day, Adjust.NONE)
+    assert calls == ["1.000001", "0.000001"]
+    assert index.value[0].close == 3500
+    assert stock.value[0].close == 10
+    assert provider.fetch_quote("000001.SH").value.price == 3500
+    assert provider.fetch_quote("000001.SZ").value.price == 10
+
+
+def test_efinance_rejects_a_quote_from_the_wrong_exchange():
+    stock = SimpleNamespace(
+        get_latest_quote=lambda *a, **k: pd.DataFrame({"行情ID": ["0.000001"], "最新价": [10]})
+    )
+    provider = EFinanceProvider(client_loader=lambda: SimpleNamespace(stock=stock))
+    with pytest.raises(DataValidationError, match="unique row"):
+        provider.fetch_quote("000001.SH")
+
+
+def test_eastmoney_and_sina_history_have_identical_share_volumes(monkeypatch):
+    day = datetime(2021, 7, 23, tzinfo=BEIJING_TZ)
+    frame = pd.DataFrame(FIXTURES["efinance"])
+    ef = EFinanceProvider(
+        client_loader=lambda: SimpleNamespace(
+            stock=SimpleNamespace(get_quote_history=lambda *a, **k: frame)
+        )
+    )
+    eastmoney = ef.fetch_bars("600519.SH", Interval.DAY_1, day, day, Adjust.QFQ)
+    sdk = SimpleNamespace(
+        stock_zh_a_hist=lambda **kwargs: frame,
+        stock_zh_a_daily=lambda **kwargs: pd.DataFrame(FIXTURES["sina_equivalent"]),
+    )
+    monkeypatch.setattr(ak_adapter, "_load_akshare", lambda: sdk)
+    ak = ak_adapter.AkShareProvider()
+    ak_eastmoney = ak.fetch_bars("600519.SH", Interval.DAY_1, day, day, Adjust.QFQ)
+
+    def fail(**kwargs):
+        raise OSError("Eastmoney unavailable")
+
+    sdk.stock_zh_a_hist = fail
+    sina = ak.fetch_bars("600519.SH", Interval.DAY_1, day, day, Adjust.QFQ)
+    for result in (eastmoney, ak_eastmoney, sina):
+        assert result.value[0].volume == Decimal(4758500)
+        assert result.value[0].amount == Decimal(9057762000)
+        assert result.quality.volume_unit == "shares"
+
+
+@pytest.mark.parametrize("sample", FIXTURES["tickflow"])
+def test_tickflow_recorded_units_and_trading_dates(sample):
+    client = SimpleNamespace(
+        klines=SimpleNamespace(get=lambda *a, **k: pd.DataFrame(sample["frame"]))
+    )
+    provider = TickFlowProvider(client_factory=lambda: client)
+    day = datetime(2026, 7, 17, tzinfo=BEIJING_TZ)
+    result = provider.fetch_bars(sample["symbol"], Interval.DAY_1, day, day, Adjust.NONE)
+    assert result.value[0].ts == day
+    assert result.value[0].volume == Decimal(sample["expected_volume"])
+    assert result.quality.currency == sample["currency"]
 
 
 @pytest.mark.parametrize(
@@ -103,3 +197,44 @@ def test_adjusted_negative_prices_survive_and_invalid_rows_are_reported():
     assert "Filtered 1" in result.warnings[0]
     unadjusted = bar_payload_from_dataframe(frame, adjust=Adjust.NONE, **arguments)
     assert unadjusted.quality.filtered_rows == 2
+
+
+def test_tickflow_paginates_inside_the_requested_history_and_marks_limits():
+    days = [datetime(2026, 7, day, tzinfo=BEIJING_TZ) for day in (13, 14, 15, 16)]
+    calls = []
+    closed = []
+
+    def get(symbol, *, start_time, end_time, count, period, adjust, as_dataframe):
+        calls.append((start_time, end_time))
+        selected = [day for day in days if start_time <= int(day.timestamp() * 1000) <= end_time][
+            -count:
+        ]
+        return pd.DataFrame(
+            [
+                {
+                    "timestamp": int(day.timestamp() * 1000),
+                    "trade_date": day.date().isoformat(),
+                    "open": 10,
+                    "high": 11,
+                    "low": 9,
+                    "close": 10,
+                    "volume": 1,
+                }
+                for day in selected
+            ]
+        )
+
+    def client():
+        return SimpleNamespace(klines=SimpleNamespace(get=get), close=lambda: closed.append(True))
+
+    provider = TickFlowProvider(client_factory=client, page_size=2, max_rows=10)
+    result = provider.fetch_bars("600519.SH", Interval.DAY_1, days[0], days[-1], Adjust.NONE)
+    assert [bar.ts for bar in result.value] == days
+    assert len(calls) == 2 and calls[1][1] < calls[0][1]
+    assert result.quality.truncated is False
+    assert closed == [True]
+    limited = TickFlowProvider(client_factory=client, page_size=2, max_rows=2)
+    partial = limited.fetch_bars("600519.SH", Interval.DAY_1, days[0], days[-1], Adjust.NONE)
+    assert partial.quality.truncated is True
+    assert partial.quality.available_start == days[2]
+    assert any("partial" in warning for warning in partial.warnings)

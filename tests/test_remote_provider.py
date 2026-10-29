@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import json
-from datetime import date, datetime
+from copy import deepcopy
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from io import BytesIO
 from urllib.parse import parse_qs, urlparse
@@ -14,6 +16,7 @@ try:
 except ModuleNotFoundError:
     TestClient = None
 
+from stock_data_hub.errors import DataValidationError
 from stock_data_hub.hub import DataHub
 from stock_data_hub.models import Adjust, AssetType, Interval, Market, QuoteFreshness
 from stock_data_hub.normalization import BEIJING_TZ
@@ -44,6 +47,7 @@ def _metadata(*, stale: bool = False) -> dict[str, object]:
         "cache_hit": False,
         "stale": stale,
         "warnings": ["peer warning"],
+        "contract_version": "2.0",
     }
 
 
@@ -110,7 +114,7 @@ def test_remote_provider_parses_bars_and_preserves_peer_metadata() -> None:
 
 def test_remote_provider_parses_delayed_quote() -> None:
     def opener(_: Request, *, timeout: float) -> JsonResponse:
-        assert timeout == 15
+        assert 90 < timeout <= 95
         return JsonResponse(
             {
                 "data": {
@@ -136,7 +140,7 @@ def test_remote_provider_collects_all_instrument_pages() -> None:
     offsets: list[int] = []
 
     def opener(request: Request, *, timeout: float) -> JsonResponse:
-        assert timeout == 15
+        assert 90 < timeout <= 95
         offset = int(parse_qs(urlparse(request.full_url).query)["offset"][0])
         offsets.append(offset)
         items = (
@@ -181,7 +185,7 @@ def test_remote_provider_collects_all_instrument_pages() -> None:
 
 def test_remote_provider_parses_reference_and_company_capabilities() -> None:
     def opener(request: Request, *, timeout: float) -> JsonResponse:
-        assert timeout == 15
+        assert 90 < timeout <= 95
         path = urlparse(request.full_url).path
         data_by_path: dict[str, object] = {
             "/trade-calendar": {
@@ -257,7 +261,7 @@ def test_forwarded_request_cannot_use_a_peer_or_peer_backed_cache() -> None:
     def opener(_: Request, *, timeout: float) -> JsonResponse:
         nonlocal calls
         calls += 1
-        assert timeout == 15
+        assert 90 < timeout <= 95
         return JsonResponse(
             {
                 "data": {
@@ -282,3 +286,141 @@ def test_forwarded_request_cannot_use_a_peer_or_peer_backed_cache() -> None:
     assert forwarded.status_code == 503
     assert forwarded.json()["error"]["type"] == "NoProviderConfigured"
     assert calls == 1
+
+
+def _bar_body():
+    return {
+        "data": [
+            {
+                "symbol": "600519.SH",
+                "market": "CN",
+                "ts": "2026-07-17T00:00:00+08:00",
+                "open": "10",
+                "high": "11",
+                "low": "9",
+                "close": "10.5",
+                "volume": "1000",
+                "amount": "10000",
+                "is_closed": True,
+            }
+        ],
+        "metadata": _metadata(),
+    }
+
+
+def _remote_bars(body, adjust=Adjust.NONE):
+    provider = RemoteHubProvider(
+        "https://peer.example", opener=lambda *args, **kwargs: JsonResponse(body)
+    )
+    day = datetime(2026, 7, 17, tzinfo=BEIJING_TZ)
+    return provider.fetch_bars("600519.SH", Interval.DAY_1, day, day, adjust)
+
+
+@pytest.mark.parametrize(
+    "section,field,value,match",
+    [
+        ("metadata", "contract_version", "1.0", "contract 2.0"),
+        ("metadata", "contract_version", None, "contract 2.0"),
+        ("metadata", "fetched_at", None, "fetched_at"),
+        ("metadata", "cache_hit", "false", "non-boolean"),
+        ("data", "symbol", "000001.SZ", "different symbol"),
+        ("data", "market", "US", "different symbol"),
+        ("data", "is_closed", "false", "non-boolean"),
+        ("data", "volume", "NaN", "invalid volume"),
+        ("data", "ts", "2026-07-18T00:00:00+08:00", "outside"),
+    ],
+)
+def test_remote_rejects_ambiguous_or_malformed_bar_contracts(section, field, value, match):
+    body = _bar_body()
+    target = body["data"][0] if section == "data" else body["metadata"]
+    target[field] = value
+    with pytest.raises(DataValidationError, match=match):
+        _remote_bars(body)
+
+
+def test_remote_preserves_nonpositive_adjusted_prices_and_rejects_duplicates():
+    body = _bar_body()
+    body["data"][0].update(open="-2", high="0", low="-3", close="-1")
+    assert _remote_bars(body, Adjust.QFQ).value[0].close == Decimal(-1)
+    with pytest.raises(DataValidationError):
+        _remote_bars(body, Adjust.NONE)
+    body["data"].append(deepcopy(body["data"][0]))
+    with pytest.raises(DataValidationError, match="duplicate"):
+        _remote_bars(body, Adjust.QFQ)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("volume_unit", "lots"),
+        ("input_rows", -1),
+        ("input_rows", True),
+        ("returned_rows", 2),
+        ("currency", "USD"),
+        ("truncated", "false"),
+    ],
+)
+def test_remote_rejects_quality_metadata_inconsistent_with_bars(field, value):
+    body = _bar_body()
+    quality = {
+        "requested_start": "2026-07-17T00:00:00+08:00",
+        "requested_end": "2026-07-17T00:00:00+08:00",
+        "available_start": "2026-07-17T00:00:00+08:00",
+        "available_end": "2026-07-17T00:00:00+08:00",
+        "input_rows": 1,
+        "returned_rows": 1,
+        "volume_unit": "shares",
+        "currency": "CNY",
+    }
+    body["metadata"]["quality"] = quality
+    assert _remote_bars(body).quality.returned_rows == 1
+    quality[field] = value
+    with pytest.raises(DataValidationError):
+        _remote_bars(body)
+
+
+@pytest.mark.parametrize(
+    "problem", ["empty_page", "changed_total", "changed_fetch", "repeat", "offset"]
+)
+def test_remote_pagination_rejects_missing_or_mixed_pages(problem):
+    def opener(request, **kwargs):
+        offset = int(parse_qs(urlparse(request.full_url).query)["offset"][0])
+        data = {
+            "items": [{"symbol": "600519.SH" if offset == 0 else "600000.SH", "name": "Example"}],
+            "offset": offset,
+            "total": 2,
+        }
+        metadata = _metadata()
+        if offset:
+            if problem == "empty_page":
+                data["items"] = []
+            elif problem == "changed_total":
+                data["total"] = 3
+            elif problem == "changed_fetch":
+                metadata["fetched_at"] = "2026-07-17T16:00:01+08:00"
+            elif problem == "repeat":
+                data["items"][0]["symbol"] = "600519.SH"
+            else:
+                data["offset"] = 0
+        return JsonResponse({"data": data, "metadata": metadata})
+
+    provider = RemoteHubProvider("https://peer.example", opener=opener)
+    with pytest.raises(DataValidationError):
+        provider.fetch_instruments()
+
+
+def test_hub_preserves_peer_fetch_time_and_marks_old_data_stale():
+    body = _bar_body()
+    original = datetime.now(tz=BEIJING_TZ) - timedelta(minutes=5)
+    body["metadata"]["fetched_at"] = original.isoformat()
+    body["metadata"]["cache_hit"] = True
+    peer = RemoteHubProvider(
+        "https://peer.example", opener=lambda *args, **kwargs: JsonResponse(body)
+    )
+    hub = DataHub([peer], attempts_per_provider=1)
+    day = datetime(2026, 7, 17, tzinfo=BEIJING_TZ)
+    result = asyncio.run(hub.get_bars("600519", "1d", day, day))
+    assert result.metadata.fetched_at == original
+    assert result.metadata.received_at > result.metadata.fetched_at
+    assert result.metadata.age_seconds > 60
+    assert result.metadata.cache_hit and result.metadata.stale

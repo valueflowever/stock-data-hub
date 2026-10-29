@@ -5,10 +5,12 @@ from __future__ import annotations
 import re
 from collections.abc import Callable
 from datetime import datetime
+from decimal import Decimal
 from typing import Any
 
 import pandas as pd
 
+from stock_data_hub.cache import SharedFetchCache
 from stock_data_hub.errors import DataValidationError, ProviderUnavailable
 from stock_data_hub.models import (
     Adjust,
@@ -23,16 +25,19 @@ from stock_data_hub.models import (
     SnapshotRow,
     SourcePayload,
 )
-from stock_data_hub.normalization import BEIJING_TZ, asset_type_from_symbol
+from stock_data_hub.normalization import (
+    asset_type_from_symbol,
+    normalize_a_share_symbol,
+    normalize_symbol,
+)
 from stock_data_hub.providers._parsing import (
     IntradayTimestampLabel,
-    bars_from_dataframe,
+    bar_payload_from_dataframe,
     decimal_or_none,
     record_value,
     required_positive_decimal,
 )
 from stock_data_hub.providers.base import MarketDataProvider
-
 
 _EASTMONEY_INTRADAY_TIMESTAMP_LABEL = IntradayTimestampLabel.CLOSE
 
@@ -48,9 +53,11 @@ class EFinanceProvider(MarketDataProvider):
     capabilities = frozenset(
         {Capability.BARS, Capability.QUOTE, Capability.SNAPSHOT, Capability.INSTRUMENTS}
     )
+    accepts_asset_type = True
 
     def __init__(self, *, client_loader: Callable[[], Any] | None = None) -> None:
         self._client_loader = client_loader
+        self._snapshots = SharedFetchCache()
 
     def fetch_bars(
         self,
@@ -59,15 +66,18 @@ class EFinanceProvider(MarketDataProvider):
         start: datetime,
         end: datetime,
         adjust: Adjust,
+        *,
+        asset_type: AssetType | None = None,
     ) -> SourcePayload[list[AShareBar]]:
+        symbol = normalize_symbol(symbol, Market.CN)
         try:
             dataframe = self._client().stock.get_quote_history(
-                _cn_code(symbol),
+                _quote_id(symbol),
                 beg=start.strftime("%Y%m%d"),
                 end=end.strftime("%Y%m%d"),
                 klt=_EFINANCE_PERIODS[interval],
                 fqt=_EFINANCE_ADJUST[adjust],
-                quote_symbol_mode=True,
+                quote_id_mode=True,
             )
         except KeyError as exc:
             raise ProviderUnavailable(f"EFinance does not support {interval.value} bars") from exc
@@ -75,53 +85,63 @@ class EFinanceProvider(MarketDataProvider):
             raise ProviderUnavailable(f"EFinance could not obtain bars for {symbol}") from exc
         if dataframe is not None and not isinstance(dataframe, pd.DataFrame):
             raise DataValidationError("EFinance bars response was not a dataframe")
-        return SourcePayload(
-            value=bars_from_dataframe(
-                dataframe,
-                symbol=symbol,
-                interval=interval,
-                start=start,
-                end=end,
-                market=Market.CN,
-                time_columns=("日期", "date"),
-                intraday_timestamp_label=_EASTMONEY_INTRADAY_TIMESTAMP_LABEL,
-            ),
+        _validate_history_symbol(dataframe, symbol)
+        return bar_payload_from_dataframe(
+            dataframe,
             source="efinance:eastmoney",
+            symbol=symbol,
+            interval=interval,
+            start=start,
+            end=end,
+            market=Market.CN,
+            time_columns=("日期", "date"),
+            intraday_timestamp_label=_EASTMONEY_INTRADAY_TIMESTAMP_LABEL,
+            adjust=adjust,
+            volume_multiplier=Decimal(100),
         )
 
-    def fetch_quote(self, symbol: str) -> SourcePayload[Quote]:
-        dataframe = self._realtime_dataframe()
-        row = _find_code_row(dataframe, _cn_code(symbol))
+    def fetch_quote(
+        self, symbol: str, *, asset_type: AssetType | None = None
+    ) -> SourcePayload[Quote]:
+        symbol = normalize_symbol(symbol, Market.CN)
+        quote_id = _quote_id(symbol)
+        # A precise secid avoids index/stock collisions and fetching thousands
+        # of securities just to answer one quote request.
+        fetched = self._snapshots.get(
+            quote_id,
+            lambda: self._client().stock.get_latest_quote([quote_id], quote_id_mode=True),
+        )
+        row = _find_quote_row(fetched.value, quote_id)
         return SourcePayload(
             value=Quote(
                 symbol=symbol,
                 price=required_positive_decimal(
                     record_value(row, "最新价", "price"), "latest price"
                 ),
-                ts=datetime.now(tz=BEIJING_TZ),
+                ts=fetched.fetched_at,
                 market=Market.CN,
             ),
             source="efinance:eastmoney",
+            fetched_at=fetched.fetched_at,
+            cache_hit=fetched.cache_hit,
         )
 
     def fetch_snapshot(self) -> SourcePayload[Snapshot]:
-        dataframe = self._realtime_dataframe()
+        fetched = self._snapshots.get("snapshot", self._realtime_dataframe)
+        dataframe = fetched.value
         rows: list[SnapshotRow] = []
         for _, row in dataframe.iterrows():
             code = _six_digit_code(record_value(row, "股票代码", "代码", "code"))
             name = record_value(row, "股票名称", "名称", "name")
             if code is None or name is None:
                 continue
-            suffix = (
-                "SH"
-                if code.startswith(("5", "6", "9"))
-                else "BJ"
-                if code.startswith(("4", "8"))
-                else "SZ"
-            )
+            try:
+                symbol = normalize_a_share_symbol(code)
+            except DataValidationError:
+                continue
             rows.append(
                 SnapshotRow(
-                    symbol=f"{code}.{suffix}",
+                    symbol=symbol,
                     name=str(name).strip(),
                     price=decimal_or_none(record_value(row, "最新价", "price")),
                     amount=decimal_or_none(record_value(row, "成交额", "amount")),
@@ -136,9 +156,11 @@ class EFinanceProvider(MarketDataProvider):
             value=Snapshot(
                 rows=tuple(sorted(rows, key=lambda item: item.symbol)),
                 has_market_cap=True,
-                fetched_at=datetime.now(tz=BEIJING_TZ),
+                fetched_at=fetched.fetched_at,
             ),
             source="efinance:eastmoney",
+            fetched_at=fetched.fetched_at,
+            cache_hit=fetched.cache_hit,
         )
 
     def fetch_instruments(self) -> SourcePayload[list[Instrument]]:
@@ -154,17 +176,22 @@ class EFinanceProvider(MarketDataProvider):
                 for row in snapshot_payload.value.rows
             ],
             source=snapshot_payload.source,
+            fetched_at=snapshot_payload.fetched_at,
+            cache_hit=snapshot_payload.cache_hit,
         )
+
+    def clear_cache(self) -> None:
+        self._snapshots.clear()
 
     def _realtime_dataframe(self) -> pd.DataFrame:
         try:
             dataframe = self._client().stock.get_realtime_quotes()
         except Exception as exc:
             raise ProviderUnavailable("EFinance realtime snapshot is unavailable") from exc
-        if dataframe is None or dataframe.empty:
-            raise ProviderUnavailable("EFinance returned an empty realtime snapshot")
         if not isinstance(dataframe, pd.DataFrame):
             raise DataValidationError("EFinance realtime response was not a dataframe")
+        if dataframe.empty:
+            raise ProviderUnavailable("EFinance returned an empty realtime snapshot")
         return dataframe
 
     def _client(self) -> Any:
@@ -179,21 +206,37 @@ class EFinanceProvider(MarketDataProvider):
         return efinance
 
 
-def _cn_code(symbol: str) -> str:
-    return symbol.split(".", maxsplit=1)[0]
+def _quote_id(symbol: str) -> str:
+    code, exchange = symbol.rsplit(".", maxsplit=1)
+    return f"{'1' if exchange == 'SH' else '0'}.{code}"
 
 
-def _find_code_row(dataframe: pd.DataFrame, code: str) -> pd.Series:
-    code_column = next(
-        (column for column in ("股票代码", "代码", "code") if column in dataframe.columns),
-        dataframe.columns[0],
-    )
-    matches = dataframe[
-        dataframe[code_column].astype(str).str.extract(r"(\d{6})", expand=False) == code
-    ]
-    if matches.empty:
-        raise DataValidationError(f"EFinance snapshot has no row for {code}")
+def _find_quote_row(dataframe: pd.DataFrame, quote_id: str) -> pd.Series:
+    if not isinstance(dataframe, pd.DataFrame) or dataframe.empty:
+        raise DataValidationError("EFinance quote response was empty or invalid")
+    column = next((c for c in ("行情ID", "secid") if c in dataframe.columns), None)
+    if column is None:
+        raise DataValidationError("EFinance quote response has no unambiguous market ID")
+    matches = dataframe[dataframe[column].astype(str).str.strip() == quote_id]
+    if len(matches) != 1:
+        raise DataValidationError(f"EFinance quote response has no unique row for {quote_id}")
     return matches.iloc[0]
+
+
+def _validate_history_symbol(dataframe: pd.DataFrame | None, symbol: str) -> None:
+    if dataframe is None or dataframe.empty:
+        return
+    code = symbol.split(".", maxsplit=1)[0]
+    for column in ("股票代码", "代码", "code"):
+        if column in dataframe.columns:
+            actual = dataframe[column].astype(str).str.zfill(6)
+            if not actual.eq(code).all():
+                raise DataValidationError(
+                    f"EFinance returned history for a different symbol: {symbol}"
+                )
+    for column in ("行情ID", "secid"):
+        if column in dataframe.columns and not dataframe[column].eq(_quote_id(symbol)).all():
+            raise DataValidationError("EFinance returned history from a different exchange")
 
 
 def _six_digit_code(value: object | None) -> str | None:

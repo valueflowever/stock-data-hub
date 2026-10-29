@@ -72,7 +72,9 @@ def test_tickflow_uses_only_anonymous_history() -> None:
     assert result.value[0].market == Market.CN
     assert result.source == "tickflow:free"
     assert result.warnings
-    assert "start_time" not in client.klines.calls[0][1]
+    assert client.klines.calls[0][1]["start_time"] == int(START.timestamp() * 1000)
+    assert "end_time" in client.klines.calls[0][1]
+    assert result.value[0].volume == 10_000
     assert not provider.supports_quote if hasattr(provider, "supports_quote") else True
 
     from stock_data_hub.models import Capability
@@ -126,7 +128,8 @@ def test_pytdx_connects_to_configured_server_for_unadjusted_daily_bars() -> None
             self.request: tuple[int, int, str, int, int] | None = None
             self.disconnected = False
 
-        def connect(self, host: str, port: int) -> bool:
+        def connect(self, host: str, port: int, *, time_out: float) -> bool:
+            assert time_out == 10
             self.connected = (host, port)
             return True
 
@@ -174,6 +177,10 @@ def test_efinance_normalizes_bars_quote_and_snapshot() -> None:
         def get_quote_history(self, _: str, **kwargs: object) -> pd.DataFrame:
             self.history_kwargs = kwargs
             return _bar_frame(chinese=True)
+
+        def get_latest_quote(self, ids: list[str], *, quote_id_mode: bool) -> pd.DataFrame:
+            assert ids == ["1.600519"] and quote_id_mode
+            return pd.DataFrame({"行情ID": ["1.600519"], "最新价": ["10.5"]})
 
         def get_realtime_quotes(self) -> pd.DataFrame:
             return pd.DataFrame(

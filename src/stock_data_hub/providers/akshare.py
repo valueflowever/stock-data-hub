@@ -8,12 +8,14 @@ contracts. Actual upstream selection is preserved in SourcePayload.source.
 from __future__ import annotations
 
 import re
+from dataclasses import replace
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
 import pandas as pd
 
+from stock_data_hub.cache import SharedFetchCache
 from stock_data_hub.errors import DataValidationError, ProviderUnavailable
 from stock_data_hub.models import (
     Adjust,
@@ -45,7 +47,7 @@ from stock_data_hub.normalization import (
 )
 from stock_data_hub.providers._parsing import (
     IntradayTimestampLabel,
-    bars_from_dataframe,
+    bar_payload_from_dataframe,
     decimal_or_none,
     is_missing,
     record_value,
@@ -53,7 +55,6 @@ from stock_data_hub.providers._parsing import (
     to_datetime,
 )
 from stock_data_hub.providers.base import MarketDataProvider
-
 
 _EASTMONEY_INTRADAY_TIMESTAMP_LABEL = IntradayTimestampLabel.CLOSE
 _SINA_INTRADAY_TIMESTAMP_LABEL = IntradayTimestampLabel.CLOSE
@@ -84,6 +85,7 @@ class AkShareProvider(MarketDataProvider):
 
     def __init__(self, *, prefer_sina_snapshot: bool = False) -> None:
         self._prefer_sina_snapshot = prefer_sina_snapshot
+        self._shared_snapshots = SharedFetchCache()
 
     def supports_request(
         self,
@@ -139,7 +141,7 @@ class AkShareProvider(MarketDataProvider):
                 if _empty_bar_window_is_expected(start, end):
                     return SourcePayload(value=[], source="akshare:eastmoney")
                 raise ProviderUnavailable(f"Eastmoney returned empty bars for {normalized}")
-            bars = _parse_bars(
+            payload = _parse_bars(
                 dataframe,
                 normalized,
                 interval,
@@ -147,10 +149,13 @@ class AkShareProvider(MarketDataProvider):
                 end,
                 market,
                 intraday_timestamp_label=_EASTMONEY_INTRADAY_TIMESTAMP_LABEL,
+                adjust=adjust,
+                volume_multiplier=Decimal(100) if market == Market.CN else Decimal(1),
+                source="akshare:eastmoney",
             )
-            if not bars:
+            if not payload.value:
                 raise DataValidationError("Eastmoney returned no usable bars")
-            return SourcePayload(value=bars, source="akshare:eastmoney")
+            return payload
         except Exception as primary_error:
             if market != Market.CN or normalized_asset_type != AssetType.STOCK:
                 raise ProviderUnavailable(
@@ -177,7 +182,7 @@ class AkShareProvider(MarketDataProvider):
                             warnings=("Eastmoney bars were unavailable; used Sina fallback.",),
                         )
                     raise ProviderUnavailable(f"Sina returned empty bars for {normalized}")
-                bars = _parse_bars(
+                payload = _parse_bars(
                     dataframe,
                     normalized,
                     interval,
@@ -185,14 +190,13 @@ class AkShareProvider(MarketDataProvider):
                     end,
                     Market.CN,
                     intraday_timestamp_label=_SINA_INTRADAY_TIMESTAMP_LABEL,
-                )
-                if not bars:
-                    raise DataValidationError("Sina returned no usable bars")
-                return SourcePayload(
-                    value=bars,
+                    adjust=adjust,
                     source="akshare:sina",
                     warnings=("Eastmoney bars were unavailable; used Sina fallback.",),
                 )
+                if not payload.value:
+                    raise DataValidationError("Sina returned no usable bars")
+                return payload
             except Exception as fallback_error:
                 raise ProviderUnavailable(
                     "AkShare could not obtain A-share bars from Eastmoney or Sina"
@@ -211,15 +215,18 @@ class AkShareProvider(MarketDataProvider):
         ak = _load_akshare()
         if market != Market.CN or normalized_asset_type != AssetType.STOCK:
             try:
-                dataframe = _quote_dataframe(ak, normalized, normalized_asset_type)
-                row = _find_market_row(dataframe, code, market)
+                fetched = self._shared_snapshots.get(
+                    f"{market.value}:{normalized_asset_type.value}:{normalized.rsplit('.', 1)[-1]}",
+                    lambda: _quote_dataframe(ak, normalized, normalized_asset_type),
+                )
+                row = _find_market_row(fetched.value, code, market)
                 return SourcePayload(
                     value=Quote(
                         symbol=normalized,
                         price=required_positive_decimal(
                             record_value(row, "最新价", "price"), "latest price"
                         ),
-                        ts=datetime.now(tz=BEIJING_TZ),
+                        ts=fetched.fetched_at,
                         market=market,
                         freshness=(
                             QuoteFreshness.REALTIME
@@ -228,6 +235,8 @@ class AkShareProvider(MarketDataProvider):
                         ),
                     ),
                     source="akshare:eastmoney",
+                    fetched_at=fetched.fetched_at,
+                    cache_hit=fetched.cache_hit,
                     warnings=(
                         ("The upstream global-market quote may be delayed.",)
                         if market != Market.CN
@@ -238,40 +247,31 @@ class AkShareProvider(MarketDataProvider):
                 raise ProviderUnavailable(
                     f"AkShare could not obtain a quote for {normalized}"
                 ) from exc
-        try:
-            row = _find_snapshot_row(ak.stock_zh_a_spot_em(), code)
-            return SourcePayload(
-                value=Quote(
-                    symbol=normalized,
-                    price=required_positive_decimal(
-                        record_value(row, "最新价", "price"), "latest price"
-                    ),
-                    ts=datetime.now(tz=BEIJING_TZ),
-                    market=Market.CN,
-                ),
-                source="akshare:eastmoney",
-            )
-        except Exception:  # noqa: BLE001 - an upstream failure triggers Sina fallback
-            try:
-                row = _find_snapshot_row(ak.stock_zh_a_spot(), code)
-                return SourcePayload(
-                    value=Quote(
-                        symbol=normalized,
-                        price=required_positive_decimal(
-                            record_value(row, "最新价", "price"), "latest price"
-                        ),
-                        ts=datetime.now(tz=BEIJING_TZ),
-                        market=Market.CN,
-                    ),
-                    source="akshare:sina",
-                    warnings=("Eastmoney quote was unavailable; used Sina fallback.",),
-                )
-            except Exception as fallback_error:
-                raise ProviderUnavailable(
-                    f"AkShare could not obtain a realtime quote for {normalized}"
-                ) from fallback_error
+        payload = self.fetch_snapshot()
+        row = next((row for row in payload.value.rows if row.symbol == normalized), None)
+        if row is None:
+            raise DataValidationError(f"AkShare snapshot has no row for {normalized}")
+        return SourcePayload(
+            Quote(
+                symbol=normalized,
+                price=required_positive_decimal(row.price, "latest price"),
+                ts=payload.value.fetched_at,
+                market=market,
+            ),
+            source=payload.source,
+            warnings=payload.warnings,
+            fetched_at=payload.fetched_at,
+            cache_hit=payload.cache_hit,
+        )
 
     def fetch_snapshot(self) -> SourcePayload[Snapshot]:
+        fetched = self._shared_snapshots.get("cn-snapshot", self._fetch_snapshot_uncached)
+        return replace(fetched.value, fetched_at=fetched.fetched_at, cache_hit=fetched.cache_hit)
+
+    def clear_cache(self) -> None:
+        self._shared_snapshots.clear()
+
+    def _fetch_snapshot_uncached(self) -> SourcePayload[Snapshot]:
         ak = _load_akshare()
         if self._prefer_sina_snapshot:
             try:
@@ -624,9 +624,15 @@ def _parse_bars(
     market: Market = Market.CN,
     *,
     intraday_timestamp_label: IntradayTimestampLabel | None = None,
-) -> list[AShareBar]:
-    return bars_from_dataframe(
+    adjust: Adjust = Adjust.NONE,
+    volume_multiplier: Decimal = Decimal(1),
+    source: str = "akshare",
+    warnings: tuple[str, ...] = (),
+) -> SourcePayload[list[AShareBar]]:
+    return bar_payload_from_dataframe(
         dataframe,
+        source=source,
+        warnings=warnings,
         symbol=symbol,
         interval=interval,
         start=start,
@@ -640,6 +646,8 @@ def _parse_bars(
         volume_columns=("成交量", "volume"),
         amount_columns=("成交额", "amount"),
         intraday_timestamp_label=intraday_timestamp_label,
+        adjust=adjust,
+        volume_multiplier=volume_multiplier,
     )
 
 

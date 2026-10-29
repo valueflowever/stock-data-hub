@@ -27,8 +27,8 @@ indicators = [
     "TA-Lib>=0.6.5,<0.8",
 ]
 sources = [
-    "tickflow[all]",
-    "efinance",
+    "tickflow[all]>=0.1.25",
+    "efinance>=0.5.9",
     "baostock",
     "pytdx>=1.72",
     "yfinance>=1.0.0",
