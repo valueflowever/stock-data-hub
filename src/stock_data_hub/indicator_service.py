@@ -13,6 +13,12 @@ from stock_data_hub.indicators.contracts import IndicatorSpec
 from stock_data_hub.indicators.engine import IndicatorEngine
 from stock_data_hub.models import Adjust, AssetType, Interval, Market
 from stock_data_hub.serialization import to_jsonable
+from stock_data_hub.service_schemas import (
+    DataEnvelope,
+    IndicatorCatalogPage,
+    IndicatorDefinitionData,
+    IndicatorResponse,
+)
 
 
 class IndicatorSpecRequest(BaseModel):
@@ -49,7 +55,7 @@ class IndicatorComputationRequest(BaseModel):
 
 
 def register_indicator_routes(app: Any, engine: IndicatorEngine) -> None:
-    @app.get("/indicators", tags=["indicators"])
+    @app.get("/indicators", tags=["indicators"], response_model=DataEnvelope[IndicatorCatalogPage])
     async def indicator_catalog(
         search: str | None = None,
         category: str | None = None,
@@ -82,7 +88,11 @@ def register_indicator_routes(app: Any, engine: IndicatorEngine) -> None:
             }
         }
 
-    @app.get("/indicators/{indicator_id}", tags=["indicators"])
+    @app.get(
+        "/indicators/{indicator_id}",
+        tags=["indicators"],
+        response_model=DataEnvelope[IndicatorDefinitionData],
+    )
     async def indicator_definition(indicator_id: str) -> dict[str, Any]:
         return {
             "data": {
@@ -91,7 +101,7 @@ def register_indicator_routes(app: Any, engine: IndicatorEngine) -> None:
             }
         }
 
-    @app.post("/indicator-computations", tags=["indicators"])
+    @app.post("/indicator-computations", tags=["indicators"], response_model=IndicatorResponse)
     async def indicator_computation(
         request: IndicatorComputationRequest,
         data_hub_hop: int = Header(default=0, alias="X-Data-Hub-Hop", ge=0),

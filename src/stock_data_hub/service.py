@@ -25,11 +25,17 @@ from stock_data_hub.errors import (
 from stock_data_hub.hub import DataHub
 from stock_data_hub.models import (
     Adjust,
+    AShareBar,
     AssetType,
+    CompanyProfile,
+    DailyClose,
     DataResult,
+    Disclosure,
     Instrument,
     Interval,
     Market,
+    Quote,
+    RestrictedRelease,
     SnapshotRow,
 )
 from stock_data_hub.providers.defaults import create_default_hub
@@ -63,6 +69,19 @@ def create_app(
             "HTTP service support is optional. Install stock-data-hub[service]."
         ) from exc
 
+    from stock_data_hub.service_schemas import (
+        AuthenticationResponse,
+        CalendarPage,
+        DataEnvelope,
+        DataResponse,
+        ErrorResponse,
+        HealthResponse,
+        HubMetrics,
+        InstrumentPage,
+        SnapshotPage,
+        ValidationResponse,
+    )
+
     data_hub = hub or create_default_hub()
     if indicator_engine is None:
         from stock_data_hub.indicators.engine import create_default_indicator_engine
@@ -86,6 +105,12 @@ def create_app(
         version="0.6.0",
         description="Provider-neutral market-data access with source and cache metadata.",
         dependencies=[Depends(require_api_key)],
+        responses={
+            401: {"model": AuthenticationResponse},
+            422: {"model": ErrorResponse | ValidationResponse},
+            502: {"model": ErrorResponse},
+            503: {"model": ErrorResponse},
+        },
     )
     app.state.data_hub = data_hub
     app.state.api_key_required = configured_api_key is not None
@@ -117,11 +142,15 @@ def create_app(
             content={"error": {"type": type(exc).__name__, "message": str(exc)}},
         )
 
-    @app.get("/health", tags=["service"])
+    @app.get("/health", tags=["service"], response_model=HealthResponse)
     async def health() -> dict[str, Any]:
         return {"data": to_jsonable(data_hub.health())}
 
-    @app.get("/quote/{symbol}", tags=["market"])
+    @app.get("/metrics", tags=["service"], response_model=DataEnvelope[HubMetrics])
+    async def metrics() -> dict[str, Any]:
+        return {"data": data_hub.metrics()}
+
+    @app.get("/quote/{symbol}", tags=["market"], response_model=DataResponse[Quote])
     async def quote(
         symbol: str,
         market: Market | None = None,
@@ -137,7 +166,7 @@ def create_app(
             )
         )
 
-    @app.get("/bars/{symbol}", tags=["market"])
+    @app.get("/bars/{symbol}", tags=["market"], response_model=DataResponse[list[AShareBar]])
     async def bars(
         symbol: str,
         start: datetime,
@@ -161,7 +190,7 @@ def create_app(
             )
         )
 
-    @app.get("/snapshot", tags=["market"])
+    @app.get("/snapshot", tags=["market"], response_model=DataResponse[SnapshotPage])
     async def snapshot(
         search: str | None = None,
         offset: int = Query(default=0, ge=0),
@@ -177,7 +206,7 @@ def create_app(
         data["limit"] = limit
         return _result_body(result, data=data)
 
-    @app.get("/instruments", tags=["reference"])
+    @app.get("/instruments", tags=["reference"], response_model=DataResponse[InstrumentPage])
     async def instruments(
         search: str | None = None,
         offset: int = Query(default=0, ge=0),
@@ -194,7 +223,7 @@ def create_app(
         }
         return _result_body(result, data=data)
 
-    @app.get("/trade-calendar", tags=["reference"])
+    @app.get("/trade-calendar", tags=["reference"], response_model=DataResponse[CalendarPage])
     async def trade_calendar(
         start: date | None = None,
         end: date | None = None,
@@ -213,7 +242,9 @@ def create_app(
         data["count"] = len(dates)
         return _result_body(result, data=data)
 
-    @app.get("/company-profile/{symbol}", tags=["company"])
+    @app.get(
+        "/company-profile/{symbol}", tags=["company"], response_model=DataResponse[CompanyProfile]
+    )
     async def company_profile(
         symbol: str,
         data_hub_hop: int = Header(default=0, alias="X-Data-Hub-Hop", ge=0),
@@ -222,7 +253,11 @@ def create_app(
             await data_hub.get_company_profile(symbol, allow_peers=data_hub_hop == 0)
         )
 
-    @app.get("/restricted-releases/{symbol}", tags=["company"])
+    @app.get(
+        "/restricted-releases/{symbol}",
+        tags=["company"],
+        response_model=DataResponse[list[RestrictedRelease]],
+    )
     async def restricted_releases(
         symbol: str,
         data_hub_hop: int = Header(default=0, alias="X-Data-Hub-Hop", ge=0),
@@ -231,7 +266,9 @@ def create_app(
             await data_hub.get_restricted_releases(symbol, allow_peers=data_hub_hop == 0)
         )
 
-    @app.get("/disclosures/{symbol}", tags=["company"])
+    @app.get(
+        "/disclosures/{symbol}", tags=["company"], response_model=DataResponse[list[Disclosure]]
+    )
     async def disclosures(
         symbol: str,
         start: date,
@@ -247,7 +284,9 @@ def create_app(
             )
         )
 
-    @app.get("/us-daily-closes/{ticker}", tags=["market"])
+    @app.get(
+        "/us-daily-closes/{ticker}", tags=["market"], response_model=DataResponse[list[DailyClose]]
+    )
     async def us_daily_closes(
         ticker: str,
         max_rows: int = Query(default=80, ge=1, le=5000),
@@ -262,9 +301,11 @@ def create_app(
         )
 
     from stock_data_hub.indicator_service import register_indicator_routes
+    from stock_data_hub.quote_service import register_quote_routes
 
     app.state.indicator_engine = indicator_engine
     register_indicator_routes(app, indicator_engine)
+    register_quote_routes(app, data_hub)
     return app
 
 

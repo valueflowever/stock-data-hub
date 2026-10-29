@@ -28,6 +28,8 @@ from stock_data_hub.models import (
     AShareBar,
     AssetType,
     BarDataQuality,
+    BatchQuoteError,
+    BatchQuoteItem,
     Capability,
     CompanyProfile,
     DailyClose,
@@ -280,6 +282,47 @@ class DataHub:
             lambda provider: provider.fetch_snapshot(),
             allow_peers=allow_peers,
         )
+
+    async def get_quotes(
+        self,
+        symbols: Sequence[str],
+        market: Market | str | None = None,
+        asset_type: AssetType | str | None = None,
+        *,
+        allow_peers: bool = True,
+    ) -> list[BatchQuoteItem]:
+        """Fetch up to 100 quotes; preserve individual failures and routing metadata."""
+        if isinstance(symbols, str) or not 1 <= len(symbols) <= 100:
+            raise ValueError("Provide between 1 and 100 symbols")
+        normalized_market = Market(market) if market is not None else None
+        normalized_asset = AssetType(asset_type) if asset_type is not None else None
+        entries: dict[str, BatchQuoteItem | None] = {}
+        for symbol in symbols:
+            try:
+                entries.setdefault(normalize_symbol(symbol, normalized_market), None)
+            except DataHubError as exc:
+                entries.setdefault(
+                    symbol,
+                    BatchQuoteItem(symbol, error=BatchQuoteError(type(exc).__name__, str(exc))),
+                )
+        gate = asyncio.Semaphore(8)
+
+        async def fetch(symbol: str) -> BatchQuoteItem:
+            error_item = entries[symbol]
+            if error_item is not None:
+                return error_item
+            async with gate:
+                try:
+                    result = await self.get_quote(
+                        symbol, asset_type=normalized_asset, allow_peers=allow_peers
+                    )
+                    return BatchQuoteItem(symbol, result.value, result.metadata)
+                except DataHubError as exc:
+                    return BatchQuoteItem(
+                        symbol, error=BatchQuoteError(type(exc).__name__, str(exc))
+                    )
+
+        return list(await asyncio.gather(*(fetch(symbol) for symbol in entries)))
 
     async def get_instruments(self, *, allow_peers: bool = True) -> DataResult[list[Instrument]]:
         return await self._resolve(

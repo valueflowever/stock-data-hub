@@ -228,3 +228,17 @@ class FetchMetadata:
 class DataResult(Generic[T]):
     value: T
     metadata: FetchMetadata
+
+
+@dataclass(frozen=True)
+class BatchQuoteError:
+    type: str
+    message: str
+
+
+@dataclass(frozen=True)
+class BatchQuoteItem:
+    symbol: str
+    data: Quote | None = None
+    metadata: FetchMetadata | None = None
+    error: BatchQuoteError | None = None
