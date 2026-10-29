@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import math
 from collections.abc import Mapping, Sequence
@@ -12,7 +11,8 @@ from time import perf_counter
 
 import numpy as np
 
-from stock_data_hub.errors import IndicatorCalculationError, InvalidIndicatorRequest
+from stock_data_hub._workers import BoundedWorkers, WorkerBusy
+from stock_data_hub.errors import IndicatorCalculationError, InvalidIndicatorRequest, ResourceBusy
 from stock_data_hub.hub import DataHub
 from stock_data_hub.indicators.catalog import CATALOG_VERSION
 from stock_data_hub.indicators.contracts import (
@@ -70,7 +70,9 @@ class IndicatorEngine:
         self.max_input_rows = max_input_rows
         self.max_output_cells = max_output_cells
         self.max_warmup_expansions = max_warmup_expansions
-        self._calculation_slots = asyncio.BoundedSemaphore(max_concurrent_calculations)
+        self._calculation_workers = BoundedWorkers(
+            max_concurrent_calculations, name="data-hub:indicators"
+        )
 
     def catalog(self) -> tuple[IndicatorDefinition, ...]:
         return self.registry.catalog()
@@ -152,14 +154,13 @@ class IndicatorEngine:
             )
 
         compute_started_at = perf_counter()
-        async with self._calculation_slots:
-            factor_columns, factor_values = await asyncio.to_thread(
-                _compute_factor_values,
-                resolved,
-                pre_bars,
-                output_bars,
-                include_inputs,
+        try:
+            factor_columns, factor_values = await self._calculation_workers.run(
+                lambda: _compute_factor_values(resolved, pre_bars, output_bars, include_inputs),
+                queue_timeout=5.0,
             )
+        except WorkerBusy as exc:
+            raise ResourceBusy("Indicator calculation queue is full or busy") from exc
         compute_latency_ms = (perf_counter() - compute_started_at) * 1000
 
         rows = tuple(
@@ -243,7 +244,6 @@ class IndicatorEngine:
         allow_peers: bool,
     ):
         span = _initial_warmup_span(interval, required_warmup)
-        previous_earliest: datetime | None = None
         result = None
         eligible: list[AShareBar] = []
         excluded_open = 0
@@ -269,12 +269,10 @@ class IndicatorEngine:
             loaded = sum(1 for bar in eligible if bar.ts < start)
             if loaded >= required_warmup or required_warmup == 0:
                 break
-            earliest = eligible[0].ts if eligible else None
             if expansion == self.max_warmup_expansions:
                 break
-            if previous_earliest is not None and earliest == previous_earliest:
+            if candidate_start == datetime.min.replace(tzinfo=start.tzinfo):
                 break
-            previous_earliest = earliest
             span *= 2
         assert result is not None
         return result, eligible, excluded_open
@@ -392,9 +390,9 @@ def _initial_warmup_span(interval: Interval, lookback: int) -> timedelta:
     if lookback <= 0:
         return timedelta()
     if interval is Interval.MINUTE_15:
-        return timedelta(minutes=15 * lookback * 16)
+        return max(timedelta(days=7), timedelta(minutes=15 * lookback * 16))
     if interval is Interval.HOUR_1:
-        return timedelta(hours=lookback * 8)
+        return max(timedelta(days=7), timedelta(hours=lookback * 8))
     if interval is Interval.DAY_1:
         return timedelta(days=lookback * 2)
     if interval is Interval.WEEK_1:

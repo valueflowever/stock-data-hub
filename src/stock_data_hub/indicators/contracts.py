@@ -9,7 +9,15 @@ from decimal import Decimal
 from enum import Enum
 from typing import Any
 
-from stock_data_hub.models import Adjust, AssetType, FetchMetadata, Interval, Market
+from stock_data_hub.models import (
+    DATA_CONTRACT_VERSION,
+    Adjust,
+    AssetType,
+    BarDataQuality,
+    FetchMetadata,
+    Interval,
+    Market,
+)
 
 
 class IndicatorParameterKind(str, Enum):
@@ -160,6 +168,10 @@ class IndicatorMetadata:
     stale: bool
     warnings: tuple[str, ...]
     computation: IndicatorRunMetadata
+    received_at: datetime | None = None
+    age_seconds: float = 0.0
+    quality: BarDataQuality | None = None
+    contract_version: str = DATA_CONTRACT_VERSION
 
     @classmethod
     def from_bars(
@@ -178,6 +190,10 @@ class IndicatorMetadata:
             stale=metadata.stale,
             warnings=warnings,
             computation=computation,
+            received_at=metadata.received_at,
+            age_seconds=metadata.age_seconds,
+            quality=metadata.quality,
+            contract_version=metadata.contract_version,
         )
 
 

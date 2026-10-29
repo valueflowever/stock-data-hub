@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from datetime import datetime, timedelta
 from decimal import Decimal
+from threading import Event, Lock
 
 import numpy as np
 import pytest
@@ -546,3 +548,143 @@ def test_indicator_http_validation_and_error_mapping() -> None:
     )
     assert unavailable.status_code == 503
     assert unavailable.json()["error"]["type"] == "IndicatorBackendUnavailable"
+
+
+def test_monday_intraday_warmup_loads_the_previous_friday() -> None:
+    friday = datetime(2026, 7, 17, 15, tzinfo=BEIJING_TZ)
+    monday = datetime(2026, 7, 20, 9, 45, tzinfo=BEIJING_TZ)
+    source = _bars(2)
+    bars = [replace(source[0], ts=friday), replace(source[1], ts=monday)]
+    result = asyncio.run(
+        _engine(FixtureHub(bars)).calculate(
+            "600519",
+            "15m",
+            monday,
+            monday,
+            [IndicatorSpec("overlap.sma", params={"period": 2})],
+            adjust="none",
+            on_insufficient="error",
+        )
+    )
+    assert result.metadata.computation.warmup_rows_loaded == 1
+    assert result.metadata.computation.calculation_start == friday
+    assert all(value is not None for value in result.value.rows[0].values.values())
+
+
+def test_warmup_continues_after_multiple_unchanged_earliest_dates() -> None:
+    # A long suspension can require several expanding windows before another bar appears.
+    monday = datetime(2026, 7, 20, 9, 45, tzinfo=BEIJING_TZ)
+    older = monday - timedelta(days=40)
+    source = _bars(2)
+    hub = FixtureHub([replace(source[0], ts=older), replace(source[1], ts=monday)])
+    result = asyncio.run(
+        _engine(hub).calculate(
+            "600519",
+            "15m",
+            monday,
+            monday,
+            [IndicatorSpec("overlap.sma", params={"period": 2})],
+            adjust="none",
+            on_insufficient="error",
+        )
+    )
+    assert hub.calls == 4
+    assert result.metadata.computation.warmup_rows_loaded == 1
+
+
+def test_indicator_cancellation_does_not_allow_overlapping_native_calculations() -> None:
+    class BlockingBackend(FixtureBackend):
+        def __init__(self) -> None:
+            self.started, self.release = Event(), Event()
+            self.lock = Lock()
+            self.active = self.peak = self.calls = 0
+
+        def compute(self, indicator_id, params, inputs):
+            with self.lock:
+                self.calls += 1
+                self.active += 1
+                self.peak = max(self.peak, self.active)
+            self.started.set()
+            try:
+                assert self.release.wait(3)
+                return super().compute(indicator_id, params, inputs)
+            finally:
+                with self.lock:
+                    self.active -= 1
+
+    backend = BlockingBackend()
+    bars = _bars(10)
+    hub = FixtureHub(bars)
+    engine = IndicatorEngine(
+        hub, IndicatorRegistry(backends=[backend]), max_concurrent_calculations=1
+    )
+
+    async def calculate():
+        return await engine.calculate(
+            "600519",
+            "1d",
+            bars[5].ts,
+            bars[-1].ts,
+            [IndicatorSpec("overlap.sma", params={"period": 2})],
+            adjust="none",
+        )
+
+    async def run() -> None:
+        first = asyncio.create_task(calculate())
+        second = None
+        try:
+
+            async def wait_started():
+                while not backend.started.is_set():
+                    await asyncio.sleep(0.001)
+
+            await asyncio.wait_for(wait_started(), 2)
+            first.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await first
+            second = asyncio.create_task(calculate())
+            await asyncio.sleep(0.1)
+            assert hub.calls == 2
+            assert backend.calls == 1
+            backend.release.set()
+            assert len((await asyncio.wait_for(second, 2)).value.rows) == 5
+            assert backend.calls == 2
+            assert backend.peak == 1
+        finally:
+            backend.release.set()
+            await asyncio.gather(
+                first, *([second] if second is not None else []), return_exceptions=True
+            )
+
+    asyncio.run(run())
+
+
+def test_indicator_adjustment_as_of_uses_original_fetch_not_local_receipt() -> None:
+    bars = _bars(10)
+    original = datetime(2026, 7, 17, 15, tzinfo=BEIJING_TZ)
+    received = original + timedelta(minutes=10)
+
+    class AgedHub(FixtureHub):
+        async def get_bars(self, *args, **kwargs):
+            result = await super().get_bars(*args, **kwargs)
+            return replace(
+                result,
+                metadata=replace(
+                    result.metadata, fetched_at=original, received_at=received, age_seconds=600
+                ),
+            )
+
+    result = asyncio.run(
+        _engine(AgedHub(bars)).calculate(
+            "600519",
+            "1d",
+            bars[5].ts,
+            bars[-1].ts,
+            [IndicatorSpec("overlap.sma", params={"period": 2})],
+            adjust="qfq",
+        )
+    )
+    assert result.metadata.computation.adjustment_as_of == original
+    assert result.metadata.fetched_at == original
+    assert result.metadata.received_at == received
+    assert result.metadata.age_seconds == 600
