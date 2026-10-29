@@ -24,6 +24,9 @@ def create_default_hub(
     peer_urls: Iterable[str] = (),
     peer_api_key: str | None = None,
     snapshot_timeout_seconds: float = 45.0,
+    request_timeout_seconds: float = 240.0,
+    local_timeout_seconds: float = 90.0,
+    peer_timeout_seconds: float = 95.0,
 ) -> DataHub:
     """Build a credential-free hub from the installed provider packages.
 
@@ -53,12 +56,16 @@ def create_default_hub(
                 peer_url,
                 name=f"remote-{index}",
                 api_key=peer_api_key,
+                timeout_seconds=peer_timeout_seconds,
             )
         )
     return DataHub(
         providers,
         source_priority=_DEFAULT_PRIORITY,
         provider_timeout_overrides={Capability.SNAPSHOT: snapshot_timeout_seconds},
+        request_timeout_seconds=request_timeout_seconds,
+        local_timeout_seconds=local_timeout_seconds,
+        peer_timeout_seconds=peer_timeout_seconds,
     )
 
 

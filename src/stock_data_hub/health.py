@@ -19,6 +19,8 @@ class ProviderHealth:
     last_error: str | None
     last_success_at: datetime | None
     circuit_open_until: datetime | None
+    timeout_count: int = 0
+    capacity_rejections: int = 0
 
 
 @dataclass
@@ -30,6 +32,8 @@ class _Runtime:
     last_error: str | None = None
     last_success_at: datetime | None = None
     circuit_open_until: datetime | None = None
+    timeout_count: int = 0
+    capacity_rejections: int = 0
 
 
 class SourceHealthRegistry:
@@ -72,6 +76,14 @@ class SourceHealthRegistry:
             if runtime.consecutive_failures >= self.failure_threshold:
                 runtime.circuit_open_until = _utc_now() + self.cooldown
 
+    def record_timeout(self, provider: str, route: str) -> None:
+        with self._lock:
+            self._runtime(provider, route).timeout_count += 1
+
+    def record_capacity_rejection(self, provider: str, route: str) -> None:
+        with self._lock:
+            self._runtime(provider, route).capacity_rejections += 1
+
     def snapshots(self) -> tuple[ProviderHealth, ...]:
         with self._lock:
             now = _utc_now()
@@ -107,6 +119,8 @@ class SourceHealthRegistry:
                             last_error=runtime.last_error,
                             last_success_at=runtime.last_success_at,
                             circuit_open_until=runtime.circuit_open_until,
+                            timeout_count=runtime.timeout_count,
+                            capacity_rejections=runtime.capacity_rejections,
                         )
                     )
             return tuple(sorted(values, key=lambda item: (item.provider, item.route or "")))

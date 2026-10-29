@@ -1,18 +1,21 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from datetime import datetime, timedelta
 from decimal import Decimal
+from threading import Event, Lock
 from time import sleep
 
 import pytest
 
-from stock_data_hub.errors import AllSourcesFailed, ProviderUnavailable
+from stock_data_hub.errors import AllSourcesFailed, ProviderUnavailable, ResourceBusy
 from stock_data_hub.hub import CachePolicy, DataHub, RouteKey
 from stock_data_hub.models import (
     Adjust,
     AShareBar,
     AssetType,
+    BarDataQuality,
     Capability,
     Interval,
     Market,
@@ -47,9 +50,18 @@ class QuoteProvider(MarketDataProvider):
 
 
 class SlowQuoteProvider(QuoteProvider):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.started = 0
+        self.finished = Event()
+
     def fetch_quote(self, symbol: str) -> SourcePayload[Quote]:
-        sleep(0.05)
-        return super().fetch_quote(symbol)
+        self.started += 1
+        try:
+            sleep(0.05)
+            return super().fetch_quote(symbol)
+        finally:
+            self.finished.set()
 
 
 class USQuoteProvider(QuoteProvider):
@@ -264,6 +276,8 @@ def test_hub_does_not_retry_a_timed_out_sdk_thread() -> None:
     with pytest.raises(AllSourcesFailed):
         asyncio.run(hub.get_quote("600519"))
 
+    assert provider.started == 1
+    assert provider.finished.wait(1)
     assert provider.calls == 1
 
 
@@ -352,3 +366,268 @@ def test_hub_routes_global_symbol_only_to_a_supporting_provider() -> None:
     assert result.value.market == Market.US
     assert result.metadata.attempted_sources == ("us",)
     assert china.calls == 0
+
+
+class BlockingQuoteProvider(QuoteProvider):
+    def __init__(self) -> None:
+        super().__init__("blocked", "blocked:quote")
+        self.started = Event()
+        self.release = Event()
+        self.finished = Event()
+        self.lock = Lock()
+        self.running = 0
+
+    def fetch_quote(self, symbol: str) -> SourcePayload[Quote]:
+        with self.lock:
+            self.running += 1
+        self.started.set()
+        try:
+            assert self.release.wait(3)
+            return super().fetch_quote(symbol)
+        finally:
+            with self.lock:
+                self.running -= 1
+                if self.running == 0:
+                    self.finished.set()
+
+
+async def _wait_for_event(event: Event) -> None:
+    async def poll() -> None:
+        while not event.is_set():
+            await asyncio.sleep(0.001)
+
+    await asyncio.wait_for(poll(), timeout=2)
+
+
+def test_blocked_sdk_slots_do_not_block_fallback_or_trip_its_circuit() -> None:
+    primary = BlockingQuoteProvider()
+    fallback = QuoteProvider("fallback", "fallback:quote")
+    hub = DataHub(
+        [primary, fallback],
+        max_concurrent_requests=2,
+        attempts_per_provider=1,
+        provider_timeout_seconds=0.1,
+        failure_threshold=100,
+    )
+
+    async def run() -> None:
+        try:
+            first = await asyncio.gather(hub.get_quote("600519"), hub.get_quote("600000"))
+            later = [await hub.get_quote(symbol) for symbol in ("600001", "600002", "600003")]
+            assert all(item.metadata.source == "fallback:quote" for item in [*first, *later])
+            health = {item.provider: item for item in hub.health()}
+            assert health["blocked"].timeout_count == 2
+            assert health["blocked"].failure_count == 2
+            assert health["blocked"].capacity_rejections == 3
+            assert health["fallback"].failure_count == 0
+            assert health["fallback"].status == "closed"
+            assert hub.metrics()["active_provider_calls"]["blocked"] == 2
+            assert hub.metrics()["fallbacks"] == 5
+        finally:
+            primary.release.set()
+            await _wait_for_event(primary.finished)
+
+    asyncio.run(run())
+
+
+def test_cancelling_first_coalesced_waiter_does_not_cancel_the_other_waiter() -> None:
+    provider = BlockingQuoteProvider()
+    hub = DataHub([provider], attempts_per_provider=1)
+
+    async def run() -> None:
+        first = asyncio.create_task(hub.get_quote("600519"))
+        second = None
+        try:
+            await _wait_for_event(provider.started)
+            second = asyncio.create_task(hub.get_quote("600519.SH"))
+            await asyncio.sleep(0)
+            first.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await first
+            provider.release.set()
+            result = await asyncio.wait_for(second, 2)
+            cached = await hub.get_quote("600519")
+            assert result.value == cached.value
+            assert cached.metadata.cache_hit
+            assert provider.calls == 1
+            assert hub.metrics()["coalesced_requests"] == 1
+        finally:
+            provider.release.set()
+            await asyncio.gather(
+                first, *([second] if second is not None else []), return_exceptions=True
+            )
+
+    asyncio.run(run())
+
+
+def test_distinct_request_limit_allows_existing_coalesced_waiters() -> None:
+    provider = BlockingQuoteProvider()
+    hub = DataHub([provider], max_inflight_requests=1)
+
+    async def run() -> None:
+        first = asyncio.create_task(hub.get_quote("600519"))
+        second = None
+        try:
+            await _wait_for_event(provider.started)
+            with pytest.raises(ResourceBusy):
+                await hub.get_quote("600000")
+            second = asyncio.create_task(hub.get_quote("600519"))
+            await asyncio.sleep(0)
+            provider.release.set()
+            assert (await first).value == (await second).value
+            assert hub.metrics()["failures"] == 1
+        finally:
+            provider.release.set()
+            await asyncio.gather(
+                first, *([second] if second is not None else []), return_exceptions=True
+            )
+
+    asyncio.run(run())
+
+
+class PartialBarsProvider(BarsProvider):
+    def __init__(self, *, filtered: bool = False) -> None:
+        super().__init__("partial")
+        self.filtered = filtered
+
+    def fetch_bars(self, symbol, interval, start, end, adjust):
+        payload = super().fetch_bars(symbol, interval, start, end, adjust)
+        return replace(
+            payload,
+            quality=BarDataQuality(
+                start,
+                end,
+                payload.value[0].ts,
+                payload.value[-1].ts,
+                2 if self.filtered else 1,
+                1,
+                filtered_rows=int(self.filtered),
+                truncated=not self.filtered,
+            ),
+        )
+
+
+@pytest.mark.parametrize("filtered", [False, True])
+def test_partial_history_prefers_a_complete_fallback(filtered: bool) -> None:
+    partial = PartialBarsProvider(filtered=filtered)
+    complete = BarsProvider("complete")
+    hub = DataHub([partial, complete], attempts_per_provider=1)
+    day = datetime(2026, 7, 17, tzinfo=BEIJING_TZ)
+
+    result = asyncio.run(hub.get_bars("600519", "1d", day, day))
+
+    assert result.metadata.source == "complete:bars"
+    assert not result.metadata.quality.truncated
+    assert result.metadata.quality.filtered_rows == 0
+    assert partial.calls == complete.calls == 1
+
+
+def test_partial_history_is_reported_and_does_not_become_verified_cache() -> None:
+    partial = PartialBarsProvider()
+    hub = DataHub([partial], attempts_per_provider=1)
+    day = datetime(2026, 7, 17, tzinfo=BEIJING_TZ)
+
+    for _ in range(2):
+        result = asyncio.run(hub.get_bars("600519", "1d", day, day))
+        assert result.metadata.quality.truncated
+        assert result.metadata.quality.missing_rows is None
+        assert not result.metadata.cache_hit
+        assert "No complete fresh source" in result.metadata.warnings[-1]
+    assert partial.calls == 2
+
+
+def test_an_empty_source_and_a_failed_source_do_not_confirm_empty_history() -> None:
+    class FailedBarsProvider(BarsProvider):
+        def fetch_bars(self, *args, **kwargs):
+            raise ProviderUnavailable("upstream failed")
+
+    hub = DataHub(
+        [BarsProvider("empty", empty=True), FailedBarsProvider("failed")], attempts_per_provider=1
+    )
+    day = datetime(2026, 7, 17, tzinfo=BEIJING_TZ)
+    with pytest.raises(AllSourcesFailed):
+        asyncio.run(hub.get_bars("600519", "1d", day, day))
+
+
+@pytest.mark.parametrize("filtered", [False, True])
+def test_unusable_partial_history_is_not_a_confirmed_empty_result(filtered: bool) -> None:
+    class UnusableHistory(BarsProvider):
+        def fetch_bars(self, symbol, interval, start, end, adjust):
+            return SourcePayload(
+                [],
+                quality=BarDataQuality(
+                    start,
+                    end,
+                    None,
+                    None,
+                    1,
+                    0,
+                    filtered_rows=int(filtered),
+                    truncated=not filtered,
+                ),
+            )
+
+    hub = DataHub([UnusableHistory("bad-history")], attempts_per_provider=1)
+    day = datetime(2026, 7, 17, tzinfo=BEIJING_TZ)
+    with pytest.raises(AllSourcesFailed, match="no usable bars"):
+        asyncio.run(hub.get_bars("600519", "1d", day, day))
+
+
+def test_original_fetch_age_shortens_cache_lifetime(monkeypatch) -> None:
+    import stock_data_hub.cache as cache_module
+    import stock_data_hub.hub as hub_module
+
+    class Clock(datetime):
+        current = datetime(2026, 7, 17, 10, tzinfo=BEIJING_TZ)
+
+        @classmethod
+        def now(cls, tz=None):
+            return cls.current.astimezone(tz)
+
+    original = Clock.current - timedelta(seconds=2)
+
+    class AgedProvider(QuoteProvider):
+        def fetch_quote(self, symbol):
+            return replace(super().fetch_quote(symbol), fetched_at=original, cache_hit=True)
+
+    monkeypatch.setattr(hub_module, "datetime", Clock)
+    monkeypatch.setattr(cache_module, "_utc_now", lambda: Clock.current)
+    provider = AgedProvider("aged", "aged:quote")
+    hub = DataHub([provider], attempts_per_provider=1)
+
+    first = asyncio.run(hub.get_quote("600519"))
+    assert first.metadata.fetched_at == original
+    assert first.metadata.received_at == Clock.current
+    assert first.metadata.age_seconds == 2
+    assert first.metadata.cache_hit
+    assert not first.metadata.stale
+    Clock.current += timedelta(milliseconds=500)
+    assert asyncio.run(hub.get_quote("600519")).metadata.age_seconds == 2.5
+    assert provider.calls == 1
+    Clock.current += timedelta(seconds=1)
+    result = asyncio.run(hub.get_quote("600519"))
+    assert provider.calls == 2
+    assert result.metadata.stale
+    assert result.metadata.fetched_at == original
+    assert result.metadata.age_seconds == 3.5
+
+
+def test_peer_timeout_budget_is_separate_from_the_local_budget() -> None:
+    primary = BlockingQuoteProvider()
+    peer = SlowQuoteProvider("peer", "peer:quote")
+    peer.is_peer = True
+    hub = DataHub(
+        [primary, peer],
+        attempts_per_provider=1,
+        provider_timeout_seconds=1,
+        local_timeout_seconds=0.02,
+        peer_timeout_seconds=1,
+        request_timeout_seconds=2,
+    )
+    try:
+        result = asyncio.run(hub.get_quote("600519"))
+        assert result.metadata.source == "peer:quote"
+        assert result.metadata.attempted_sources == ("blocked", "peer")
+    finally:
+        primary.release.set()
+        assert primary.finished.wait(2)

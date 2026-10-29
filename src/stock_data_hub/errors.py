@@ -19,6 +19,10 @@ class ProviderUnavailable(ProviderError):
     """A provider or its upstream is temporarily unavailable."""
 
 
+class ResourceBusy(DataHubError):
+    """The local bounded request or computation queue is full."""
+
+
 class UnsupportedCapability(ProviderError):
     """The selected provider cannot serve this capability."""
 

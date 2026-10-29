@@ -20,6 +20,7 @@ from stock_data_hub.errors import (
     InvalidRequest,
     NoProviderConfigured,
     ProviderError,
+    ResourceBusy,
 )
 from stock_data_hub.hub import DataHub
 from stock_data_hub.models import (
@@ -97,7 +98,7 @@ def create_app(
             status_code = 422
         elif isinstance(
             exc,
-            (AllSourcesFailed, IndicatorBackendUnavailable, NoProviderConfigured),
+            (AllSourcesFailed, IndicatorBackendUnavailable, NoProviderConfigured, ResourceBusy),
         ):
             status_code = 503
         elif isinstance(exc, ProviderError):

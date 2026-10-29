@@ -43,6 +43,9 @@ class MarketDataProvider:
     accepts_asset_type = False
     is_peer = False
 
+    def clear_cache(self) -> None:
+        """Clear optional adapter-local shared snapshots."""
+
     def supports(self, capability: Capability) -> bool:
         return capability in self.capabilities
 

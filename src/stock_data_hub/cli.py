@@ -18,6 +18,24 @@ def main() -> None:
     serve.add_argument("--pytdx-host", help="enable PyTDX with this quote-server host")
     serve.add_argument("--pytdx-port", type=int, default=7709)
     serve.add_argument(
+        "--request-timeout",
+        type=float,
+        default=_environment_float("STOCK_DATA_HUB_REQUEST_TIMEOUT_SECONDS", 240.0),
+        help="total routing budget including peers (seconds)",
+    )
+    serve.add_argument(
+        "--local-timeout",
+        type=float,
+        default=_environment_float("STOCK_DATA_HUB_LOCAL_TIMEOUT_SECONDS", 90.0),
+        help="combined local-source routing budget (seconds)",
+    )
+    serve.add_argument(
+        "--peer-timeout",
+        type=float,
+        default=_environment_float("STOCK_DATA_HUB_PEER_TIMEOUT_SECONDS", 95.0),
+        help="per-peer budget; allow the peer to finish its local routing",
+    )
+    serve.add_argument(
         "--snapshot-timeout",
         type=float,
         default=_environment_float("STOCK_DATA_HUB_SNAPSHOT_TIMEOUT_SECONDS", 45.0),
@@ -43,6 +61,9 @@ def main() -> None:
             peer_urls=peer_urls,
             peer_api_key=os.getenv("STOCK_DATA_HUB_PEER_API_KEY"),
             snapshot_timeout_seconds=args.snapshot_timeout,
+            request_timeout_seconds=args.request_timeout,
+            local_timeout_seconds=args.local_timeout,
+            peer_timeout_seconds=args.peer_timeout,
         )
         uvicorn.run(create_app(hub), host=args.host, port=args.port)
 

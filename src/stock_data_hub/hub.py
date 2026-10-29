@@ -6,16 +6,20 @@ import asyncio
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
-from threading import BoundedSemaphore, Event, Lock
+from math import isfinite
+from threading import Lock
 from time import perf_counter
 from typing import TypeVar
 
+from stock_data_hub._workers import BoundedWorkers, WorkerBusy
 from stock_data_hub.cache import InMemoryResultCache
 from stock_data_hub.errors import (
     AllSourcesFailed,
+    DataHubError,
     DataValidationError,
     NoProviderConfigured,
     ProviderUnavailable,
+    ResourceBusy,
     UnsupportedCapability,
 )
 from stock_data_hub.health import ProviderHealth, SourceHealthRegistry
@@ -23,6 +27,7 @@ from stock_data_hub.models import (
     Adjust,
     AShareBar,
     AssetType,
+    BarDataQuality,
     Capability,
     CompanyProfile,
     DailyClose,
@@ -108,21 +113,36 @@ class DataHub:
         provider_timeout_seconds: float | None = 20.0,
         provider_timeout_overrides: Mapping[Capability | str, float | None] | None = None,
         max_concurrent_requests: int = 8,
+        request_timeout_seconds: float = 240.0,
+        local_timeout_seconds: float = 90.0,
+        peer_timeout_seconds: float = 95.0,
+        max_inflight_requests: int = 512,
     ) -> None:
         if attempts_per_provider < 1:
             raise ValueError("attempts_per_provider must be at least one")
         if retry_delay_seconds < 0:
             raise ValueError("retry_delay_seconds cannot be negative")
-        if provider_timeout_seconds is not None and provider_timeout_seconds <= 0:
+        if provider_timeout_seconds is not None and (
+            not isfinite(provider_timeout_seconds) or provider_timeout_seconds <= 0
+        ):
             raise ValueError("provider_timeout_seconds must be positive or None")
         normalized_timeout_overrides: dict[Capability, float | None] = {}
         for raw_capability, timeout_seconds in (provider_timeout_overrides or {}).items():
             capability = Capability(raw_capability)
-            if timeout_seconds is not None and timeout_seconds <= 0:
+            if timeout_seconds is not None and (
+                not isfinite(timeout_seconds) or timeout_seconds <= 0
+            ):
                 raise ValueError("provider timeout overrides must be positive or None")
             normalized_timeout_overrides[capability] = timeout_seconds
         if max_concurrent_requests < 1:
             raise ValueError("max_concurrent_requests must be at least one")
+        if any(
+            not isfinite(value) or value <= 0
+            for value in (request_timeout_seconds, local_timeout_seconds, peer_timeout_seconds)
+        ):
+            raise ValueError("Request and peer deadlines must be positive")
+        if max_inflight_requests < 1:
+            raise ValueError("max_inflight_requests must be positive")
 
         self._providers: dict[str, MarketDataProvider] = {}
         self._source_priority = _normalize_priority(source_priority)
@@ -132,12 +152,26 @@ class DataHub:
         self._retry_delay_seconds = retry_delay_seconds
         self._provider_timeout_seconds = provider_timeout_seconds
         self._provider_timeout_overrides = normalized_timeout_overrides
-        # A thread-safe semaphore keeps a busy upstream from creating an
-        # unbounded number of blocking SDK calls, even if this hub is used by
-        # more than one event loop.
-        self._provider_slots = BoundedSemaphore(max_concurrent_requests)
-        self._inflight: dict[tuple[int, str], asyncio.Future[DataResult[object]]] = {}
+        self._worker_capacity = max_concurrent_requests
+        self._workers: dict[str, BoundedWorkers] = {}
+        self._request_timeout_seconds = request_timeout_seconds
+        self._local_timeout_seconds = local_timeout_seconds
+        self._peer_timeout_seconds = peer_timeout_seconds
+        self._max_inflight_requests = max_inflight_requests
+        self._inflight: dict[tuple[int, str], asyncio.Task] = {}
         self._inflight_lock = Lock()
+        self._metrics_lock = Lock()
+        self._metrics = dict.fromkeys(
+            (
+                "requests",
+                "cache_hits",
+                "stale_returns",
+                "coalesced_requests",
+                "fallbacks",
+                "failures",
+            ),
+            0,
+        )
         self._health = SourceHealthRegistry(
             failure_threshold=failure_threshold,
             cooldown=circuit_cooldown,
@@ -152,13 +186,25 @@ class DataHub:
         if name in self._providers:
             raise ValueError(f"A provider named {name!r} is already registered")
         self._providers[name] = provider
+        self._workers[name] = BoundedWorkers(self._worker_capacity, name=f"data-hub:{name}")
         self._health.ensure(name)
 
     def clear_cache(self) -> None:
         self._cache.clear()
+        for provider in self._providers.values():
+            provider.clear_cache()
 
     def health(self) -> tuple[ProviderHealth, ...]:
         return self._health.snapshots()
+
+    def metrics(self) -> dict[str, object]:
+        with self._metrics_lock:
+            counts = dict(self._metrics)
+        return {**counts, "active_provider_calls": {k: v.active for k, v in self._workers.items()}}
+
+    def _count(self, name: str) -> None:
+        with self._metrics_lock:
+            self._metrics[name] += 1
 
     async def get_bars(
         self,
@@ -329,35 +375,53 @@ class DataHub:
         adjust: Adjust | None = None,
         allow_peers: bool = True,
     ) -> DataResult[T]:
+        self._count("requests")
         cache_key = _scoped_cache_key(cache_key, allow_peers)
         fresh = self._cache.get_fresh(cache_key)
         if fresh is not None:
+            self._count("cache_hits")
             return _cached_result(fresh, stale=False)
 
-        owner, shared = self._claim_inflight(cache_key)
-        if not owner:
-            return await asyncio.shield(shared)  # type: ignore[return-value]
+        loop = asyncio.get_running_loop()
+        inflight_key = (id(loop), cache_key)
+        with self._inflight_lock:
+            shared = self._inflight.get(inflight_key)
+            if shared is None:
+                if len(self._inflight) >= self._max_inflight_requests:
+                    self._count("failures")
+                    raise ResourceBusy("Too many distinct requests are already in flight")
+                shared = loop.create_task(
+                    self._resolve_uncached(
+                        capability,
+                        cache_key,
+                        invoke,
+                        market=market,
+                        asset_type=asset_type,
+                        interval=interval,
+                        adjust=adjust,
+                        allow_peers=allow_peers,
+                    )
+                )
+                self._inflight[inflight_key] = shared
+                shared.add_done_callback(lambda task: self._finish_inflight(inflight_key, task))
+            else:
+                self._count("coalesced_requests")
         try:
-            result = await self._resolve_uncached(
-                capability,
-                cache_key,
-                invoke,
-                market=market,
-                asset_type=asset_type,
-                interval=interval,
-                adjust=adjust,
-                allow_peers=allow_peers,
-            )
-            shared.set_result(result)
+            # Every caller (including the first) is only a waiter. Cancelling
+            # one HTTP request cannot cancel work still needed by another.
+            result = await asyncio.shield(shared)
+            if result.metadata.stale:
+                self._count("stale_returns")
             return result
-        except BaseException as exc:
-            if not shared.done():
-                shared.set_exception(exc)
-                shared.exception()
+        except DataHubError:
+            self._count("failures")
             raise
-        finally:
-            with self._inflight_lock:
-                self._inflight.pop((id(asyncio.get_running_loop()), cache_key), None)
+
+    def _finish_inflight(self, key: tuple[int, str], task: asyncio.Task) -> None:
+        with self._inflight_lock:
+            if self._inflight.get(key) is task:
+                self._inflight.pop(key)
+        _consume_task_exception(task)
 
     async def _resolve_uncached(
         self,
@@ -371,6 +435,9 @@ class DataHub:
         adjust: Adjust | None,
         allow_peers: bool,
     ) -> DataResult[T]:
+        started_at = perf_counter()
+        deadline = started_at + self._request_timeout_seconds
+        local_deadline = min(deadline, started_at + self._local_timeout_seconds)
         providers = self._providers_for(
             capability,
             market,
@@ -389,9 +456,17 @@ class DataHub:
         errors: dict[str, str] = {}
         attempted: list[str] = []
         empty_candidate: tuple[MarketDataProvider, SourcePayload[T], float] | None = None
+        partial_candidate: tuple[MarketDataProvider, SourcePayload[T], float] | None = None
+        all_empty = True
         for provider in providers:
+            provider_deadline = deadline if provider.is_peer else local_deadline
+            if perf_counter() >= provider_deadline:
+                errors[provider.name] = "routing deadline exhausted"
+                all_empty = False
+                continue
             if not self._health.can_attempt(provider.name, health_route):
                 errors[provider.name] = "circuit breaker is open"
+                all_empty = False
                 continue
 
             attempted.append(provider.name)
@@ -400,28 +475,32 @@ class DataHub:
                 invoke,
                 health_route,
                 capability,
+                provider_deadline,
             )
             if error is None and payload is not None:
-                source = payload.source or provider.name
-                result = DataResult(
-                    value=payload.value,
-                    metadata=FetchMetadata(
-                        source=source,
-                        fetched_at=datetime.now(tz=BEIJING_TZ),
-                        latency_ms=latency_ms,
-                        attempted_sources=tuple(attempted),
-                        stale=payload.stale,
-                        warnings=payload.warnings,
-                    ),
+                if payload.fetched_at is not None:
+                    age = datetime.now(tz=BEIJING_TZ) - to_beijing(payload.fetched_at)
+                    if age >= self._cache_policies[capability].ttl:
+                        payload = replace(payload, stale=True)
+                if payload.stale or (
+                    payload.quality is not None
+                    and (payload.quality.truncated or payload.quality.filtered_rows)
+                ):
+                    partial_candidate = partial_candidate or (provider, payload, latency_ms)
+                    all_empty = False
+                    continue
+                if len(attempted) > 1:
+                    self._count("fallbacks")
+                return self._store_result(
+                    capability, cache_key, provider, payload, attempted, started_at
                 )
-                policy = self._cache_policies[capability]
-                self._cache.set(cache_key, result, policy.ttl, policy.stale_ttl)
-                return result
 
             assert error is not None
             errors[provider.name] = _short_error(error)
             if isinstance(error, _EmptyBarsResult) and payload is not None:
                 empty_candidate = (provider, payload, latency_ms)
+            else:
+                all_empty = False
 
         stale = self._cache.get_stale(cache_key)
         if stale is not None:
@@ -430,38 +509,68 @@ class DataHub:
                 stale=True,
                 warning="All live sources failed; returned the last verified cached result.",
             )
-        if empty_candidate is not None:
-            provider, payload, latency_ms = empty_candidate
-            warning = "All eligible live sources returned no bars for the requested window."
-            warnings = payload.warnings
-            if warning not in warnings:
-                warnings = (*warnings, warning)
-            result = DataResult(
-                value=payload.value,
-                metadata=FetchMetadata(
-                    source=payload.source or provider.name,
-                    fetched_at=datetime.now(tz=BEIJING_TZ),
-                    latency_ms=latency_ms,
-                    attempted_sources=tuple(attempted),
-                    stale=payload.stale,
-                    warnings=warnings,
+        if partial_candidate is not None:
+            provider, payload, _ = partial_candidate
+            payload = replace(
+                payload, warnings=(*payload.warnings, "No complete fresh source was available.")
+            )
+            return self._store_result(
+                capability, cache_key, provider, payload, attempted, started_at
+            )
+        if empty_candidate is not None and all_empty:
+            provider, payload, _ = empty_candidate
+            payload = replace(
+                payload,
+                warnings=(
+                    *payload.warnings,
+                    "All eligible live sources returned no bars for the requested window.",
                 ),
             )
-            policy = self._cache_policies[capability]
-            self._cache.set(cache_key, result, policy.ttl, policy.stale_ttl)
-            return result
+            return self._store_result(
+                capability, cache_key, provider, payload, attempted, started_at
+            )
         raise AllSourcesFailed(capability, errors)
 
-    def _claim_inflight(self, cache_key: str) -> tuple[bool, asyncio.Future[DataResult[T]]]:
-        loop = asyncio.get_running_loop()
-        inflight_key = (id(loop), cache_key)
-        with self._inflight_lock:
-            existing = self._inflight.get(inflight_key)
-            if existing is not None:
-                return False, existing  # type: ignore[return-value]
-            future: asyncio.Future[DataResult[object]] = loop.create_future()
-            self._inflight[inflight_key] = future
-            return True, future  # type: ignore[return-value]
+    def _store_result(
+        self,
+        capability: Capability,
+        cache_key: str,
+        provider: MarketDataProvider,
+        payload: SourcePayload[T],
+        attempted: Sequence[str],
+        started_at: float,
+    ) -> DataResult[T]:
+        received_at = datetime.now(tz=BEIJING_TZ)
+        fetched_at = to_beijing(payload.fetched_at) if payload.fetched_at else received_at
+        age = max((received_at - fetched_at).total_seconds(), 0.0)
+        result = DataResult(
+            payload.value,
+            FetchMetadata(
+                source=payload.source or provider.name,
+                fetched_at=fetched_at,
+                received_at=received_at,
+                age_seconds=age,
+                latency_ms=(perf_counter() - started_at) * 1000,
+                attempted_sources=tuple(attempted),
+                stale=payload.stale,
+                cache_hit=payload.cache_hit,
+                warnings=payload.warnings,
+                quality=payload.quality,
+            ),
+        )
+        if payload.quality and (payload.quality.truncated or payload.quality.filtered_rows):
+            # An incomplete response must never replace a verified cached history.
+            return result
+        policy = self._cache_policies[capability]
+        age_delta = timedelta(seconds=age)
+        fresh_remaining = max(policy.ttl - age_delta, timedelta())
+        if payload.stale:
+            fresh_remaining = timedelta()
+        total_remaining = max(policy.ttl + policy.stale_ttl - age_delta, timedelta())
+        self._cache.set(
+            cache_key, result, fresh_remaining, max(total_remaining - fresh_remaining, timedelta())
+        )
+        return result
 
     async def _attempt_provider(
         self,
@@ -469,15 +578,23 @@ class DataHub:
         invoke: Callable[[MarketDataProvider], SourcePayload[T]],
         health_route: str,
         capability: Capability,
+        deadline: float,
     ) -> tuple[SourcePayload[T] | None, float, Exception | None]:
         last_error: Exception | None = None
         total_latency_ms = 0.0
-        timeout_seconds = self._provider_timeout_overrides.get(
-            capability,
-            self._provider_timeout_seconds,
+        configured_timeout = (
+            self._peer_timeout_seconds
+            if provider.is_peer
+            else self._provider_timeout_overrides.get(capability, self._provider_timeout_seconds)
         )
         for attempt in range(self._attempts_per_provider):
             started_at = perf_counter()
+            remaining = deadline - started_at
+            if remaining <= 0:
+                return None, total_latency_ms, ProviderUnavailable("Routing deadline exhausted")
+            timeout_seconds = (
+                min(configured_timeout, remaining) if configured_timeout else remaining
+            )
             try:
                 payload = await self._invoke_provider(provider, invoke, timeout_seconds)
                 latency_ms = (perf_counter() - started_at) * 1000
@@ -493,11 +610,15 @@ class DataHub:
             except _EmptyBarsResult as exc:
                 total_latency_ms += (perf_counter() - started_at) * 1000
                 return exc.payload, total_latency_ms, exc  # type: ignore[return-value]
+            except WorkerBusy as exc:
+                self._health.record_capacity_rejection(provider.name, health_route)
+                return None, total_latency_ms, exc
             except asyncio.TimeoutError:
                 total_latency_ms += (perf_counter() - started_at) * 1000
                 last_error = ProviderUnavailable(
                     f"{provider.name} timed out after {timeout_seconds} seconds"
                 )
+                self._health.record_timeout(provider.name, health_route)
                 # Python cannot safely cancel a running SDK thread. Starting
                 # another attempt would duplicate the same upstream request.
                 break
@@ -507,7 +628,11 @@ class DataHub:
                 total_latency_ms += (perf_counter() - started_at) * 1000
                 last_error = exc
             if attempt + 1 < self._attempts_per_provider and self._retry_delay_seconds:
-                await asyncio.sleep(self._retry_delay_seconds * (attempt + 1))
+                await asyncio.sleep(
+                    min(
+                        self._retry_delay_seconds * (attempt + 1), max(deadline - perf_counter(), 0)
+                    )
+                )
 
         assert last_error is not None
         self._health.record_failure(provider.name, health_route, last_error)
@@ -519,38 +644,11 @@ class DataHub:
         invoke: Callable[[MarketDataProvider], SourcePayload[T]],
         timeout_seconds: float | None,
     ) -> SourcePayload[T]:
-        cancel_requested = Event()
-        task = asyncio.create_task(
-            asyncio.to_thread(self._invoke_with_slot, provider, invoke, cancel_requested)
+        return await self._workers[provider.name].run(
+            lambda: invoke(provider),
+            timeout=timeout_seconds,
+            queue_timeout=min(0.05, timeout_seconds) if timeout_seconds else 0.05,
         )
-        if timeout_seconds is None:
-            return await task
-        try:
-            return await asyncio.wait_for(asyncio.shield(task), timeout=timeout_seconds)
-        except asyncio.CancelledError:
-            cancel_requested.set()
-            task.add_done_callback(_consume_task_exception)
-            raise
-        except asyncio.TimeoutError:
-            cancel_requested.set()
-            task.add_done_callback(_consume_task_exception)
-            raise
-
-    def _invoke_with_slot(
-        self,
-        provider: MarketDataProvider,
-        invoke: Callable[[MarketDataProvider], SourcePayload[T]],
-        cancel_requested: Event,
-    ) -> SourcePayload[T]:
-        while not cancel_requested.is_set():
-            if self._provider_slots.acquire(timeout=0.05):
-                try:
-                    if cancel_requested.is_set():
-                        raise ProviderUnavailable(f"{provider.name} invocation was cancelled")
-                    return invoke(provider)
-                finally:
-                    self._provider_slots.release()
-        raise ProviderUnavailable(f"{provider.name} invocation was cancelled")
 
     def _providers_for(
         self,
@@ -676,6 +774,12 @@ def _cached_result(
             cache_hit=True,
             stale=stale or value.metadata.stale,
             warnings=warnings,
+            age_seconds=max(
+                (
+                    datetime.now(tz=BEIJING_TZ) - to_beijing(value.metadata.fetched_at)
+                ).total_seconds(),
+                0.0,
+            ),
         ),
     )
 
@@ -710,6 +814,57 @@ def _fetch_bars(
         )
     else:
         payload = provider.fetch_bars(symbol, interval, start, end, adjust)
+    if not isinstance(payload, SourcePayload) or not isinstance(payload.value, list):
+        raise DataValidationError("Provider bars must be a SourcePayload containing a list")
+    for bar in payload.value:
+        if (
+            not isinstance(bar, AShareBar)
+            or bar.symbol != symbol
+            or bar.market != market_from_symbol(symbol)
+        ):
+            raise DataValidationError("Provider returned bars for a different symbol or market")
+        prices = (bar.open, bar.high, bar.low, bar.close)
+        if any(not value.is_finite() for value in prices):
+            raise DataValidationError("Provider returned non-finite bar prices")
+        if adjust is Adjust.NONE and any(value <= 0 for value in prices):
+            raise DataValidationError("Provider returned a non-positive unadjusted bar price")
+        if bar.low > min(bar.open, bar.close) or max(bar.open, bar.close) > bar.high:
+            raise DataValidationError("Provider returned an invalid OHLC relationship")
+        if bar.ts.tzinfo is None or not start <= bar.ts <= end:
+            raise DataValidationError("Provider returned a bar outside the requested time window")
+        if type(bar.is_closed) is not bool:
+            raise DataValidationError("Provider returned a non-boolean is_closed")
+        if any(
+            value is not None and (not value.is_finite() or value < 0)
+            for value in (bar.volume, bar.amount)
+        ):
+            raise DataValidationError("Provider returned an invalid volume or amount")
+    if len({bar.ts for bar in payload.value}) != len(payload.value):
+        raise DataValidationError("Provider returned duplicate bar timestamps")
+    payload = replace(payload, value=sorted(payload.value, key=lambda bar: bar.ts))
+    if payload.quality is None:
+        payload = replace(
+            payload,
+            quality=BarDataQuality(
+                start,
+                end,
+                payload.value[0].ts if payload.value else None,
+                payload.value[-1].ts if payload.value else None,
+                len(payload.value),
+                len(payload.value),
+                currency={Market.CN: "CNY", Market.HK: "HKD", Market.US: "USD"}[
+                    market_from_symbol(symbol)
+                ],
+            ),
+        )
+    if (
+        not payload.value
+        and payload.quality is not None
+        and (payload.quality.truncated or payload.quality.filtered_rows)
+    ):
+        raise DataValidationError(
+            "Provider returned no usable bars from incomplete or invalid history"
+        )
     if not payload.value and _bar_window_requires_data(start, end):
         raise _EmptyBarsResult(payload)
     return payload
@@ -721,8 +876,17 @@ def _fetch_quote(
     asset_type: AssetType,
 ) -> SourcePayload[Quote]:
     if provider.accepts_asset_type:
-        return provider.fetch_quote(symbol, asset_type=asset_type)
-    return provider.fetch_quote(symbol)
+        payload = provider.fetch_quote(symbol, asset_type=asset_type)
+    else:
+        payload = provider.fetch_quote(symbol)
+    if not isinstance(payload, SourcePayload) or not isinstance(payload.value, Quote):
+        raise DataValidationError("Provider returned an invalid quote contract")
+    quote = payload.value
+    if quote.symbol != symbol or quote.market != market_from_symbol(symbol):
+        raise DataValidationError("Provider returned a quote for a different symbol or market")
+    if not quote.price.is_finite() or quote.price <= 0:
+        raise DataValidationError("Provider returned an invalid quote price")
+    return payload
 
 
 def _fetch_us_daily_closes(

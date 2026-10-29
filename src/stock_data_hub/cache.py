@@ -3,10 +3,16 @@
 from __future__ import annotations
 
 from collections import OrderedDict
-from dataclasses import dataclass
+from collections.abc import Callable
+from concurrent.futures import Future
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
+from math import isfinite
 from threading import RLock
+from time import monotonic
 from typing import Generic, TypeVar
+
+from stock_data_hub._workers import remaining_timeout
 
 T = TypeVar("T")
 
@@ -74,3 +80,61 @@ class InMemoryResultCache:
 
 def _utc_now() -> datetime:
     return datetime.now(tz=timezone.utc)
+
+
+@dataclass(frozen=True)
+class CachedFetch(Generic[T]):
+    value: T
+    fetched_at: datetime
+    cache_hit: bool = False
+
+
+class SharedFetchCache:
+    """Short-lived SDK snapshots shared by quote, snapshot, and instrument requests.
+
+    Fetches for different keys are independent; identical concurrent fetches
+    share one result, and failed refreshes never promote old data to fresh.
+    """
+
+    def __init__(self, ttl_seconds: float = 3, max_entries: int = 16) -> None:
+        if not isfinite(ttl_seconds) or ttl_seconds < 0 or max_entries < 1:
+            raise ValueError("Invalid shared-fetch cache limits")
+        self.ttl_seconds = ttl_seconds
+        self.max_entries = max_entries
+        self._values: OrderedDict[str, tuple[float, CachedFetch]] = OrderedDict()
+        self._inflight: dict[str, Future] = {}
+        self._fetch_lock = RLock()
+
+    def get(self, key: str, loader: Callable[[], T]) -> CachedFetch[T]:
+        with self._fetch_lock:
+            cached = self._values.get(key)
+            if cached is not None and cached[0] > monotonic():
+                self._values.move_to_end(key)
+                return replace(cached[1], cache_hit=True)
+            pending = self._inflight.get(key)
+            owner = pending is None
+            if owner:
+                pending = Future()
+                self._inflight[key] = pending
+        assert pending is not None
+        if not owner:
+            return replace(pending.result(timeout=remaining_timeout(20.0)), cache_hit=True)
+        try:
+            result = CachedFetch(loader(), _utc_now())
+            with self._fetch_lock:
+                self._values[key] = (monotonic() + self.ttl_seconds, result)
+                self._values.move_to_end(key)
+                while len(self._values) > self.max_entries:
+                    self._values.popitem(last=False)
+            pending.set_result(result)
+            return result
+        except BaseException as exc:
+            pending.set_exception(exc)
+            raise
+        finally:
+            with self._fetch_lock:
+                self._inflight.pop(key, None)
+
+    def clear(self) -> None:
+        with self._fetch_lock:
+            self._values.clear()
