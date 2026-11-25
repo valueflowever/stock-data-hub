@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import date, datetime
 
 from stock_data_hub.errors import UnsupportedCapability
 from stock_data_hub.models import (
     Adjust,
+    AdjustFactor,
     AShareBar,
     AssetType,
     Capability,
@@ -41,10 +43,24 @@ class MarketDataProvider:
     intervals: frozenset[Interval] = frozenset()
     adjustments: frozenset[Adjust] = frozenset()
     accepts_asset_type = False
+    accepts_us_close_adjust = False
     is_peer = False
+    # Historical-only sources (e.g. TickFlow free) omit the developing daily bar
+    # during market hours. Setting this to False lets the hub prefer a live
+    # provider when the requested window reaches the active trading session.
+    supports_intraday_daily_bar = True
+    supports_batch_quotes = False
 
     def clear_cache(self) -> None:
         """Clear optional adapter-local shared snapshots."""
+
+    def prefetch_quotes(
+        self,
+        symbols: Sequence[str],
+        *,
+        asset_type: AssetType | None = None,
+    ) -> None:
+        """Optionally warm adapter-local quote cache in one batch upstream call."""
 
     def supports(self, capability: Capability) -> bool:
         return capability in self.capabilities
@@ -117,8 +133,22 @@ class MarketDataProvider:
     ) -> SourcePayload[list[Disclosure]]:
         raise self._unsupported(Capability.DISCLOSURES)
 
-    def fetch_us_daily_closes(self, ticker: str, max_rows: int) -> SourcePayload[list[DailyClose]]:
+    def fetch_us_daily_closes(
+        self,
+        ticker: str,
+        max_rows: int,
+        *,
+        adjust: Adjust = Adjust.NONE,
+    ) -> SourcePayload[list[DailyClose]]:
         raise self._unsupported(Capability.US_DAILY_CLOSES)
+
+    def fetch_adjust_factors(
+        self,
+        symbol: str,
+        start: date | None = None,
+        end: date | None = None,
+    ) -> SourcePayload[list[AdjustFactor]]:
+        raise self._unsupported(Capability.ADJUST_FACTORS)
 
     def _unsupported(self, capability: Capability) -> UnsupportedCapability:
         return UnsupportedCapability(f"{self.name} does not support {capability.value}")

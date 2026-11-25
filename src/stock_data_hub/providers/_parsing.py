@@ -12,9 +12,18 @@ from typing import Any
 import pandas as pd
 
 from stock_data_hub.errors import DataValidationError
-from stock_data_hub.models import Adjust, AShareBar, BarDataQuality, Interval, Market, SourcePayload
+from stock_data_hub.models import (
+    Adjust,
+    AdjustMethod,
+    AShareBar,
+    AssetType,
+    BarDataQuality,
+    Interval,
+    Market,
+    SourcePayload,
+)
 from stock_data_hub.normalization import BEIJING_TZ, is_bar_closed, to_beijing
-from stock_data_hub.trading_sessions import market_timezone
+from stock_data_hub.trading_sessions import intraday_bar_close, market_timezone
 
 
 class IntradayTimestampLabel(str, Enum):
@@ -35,6 +44,8 @@ class ParseDiagnostics:
     input_rows: int = 0
     filtered_rows: int = 0
     duplicate_rows: int = 0
+    suspended_rows: int = 0
+    extreme_range_rows: int = 0
 
 
 def bar_payload_from_dataframe(
@@ -43,14 +54,31 @@ def bar_payload_from_dataframe(
     source: str,
     warnings: tuple[str, ...] = (),
     truncated: bool = False,
+    adjust_method: AdjustMethod | str | None = None,
     **kwargs: Any,
 ) -> SourcePayload[list[AShareBar]]:
     diagnostics = ParseDiagnostics()
+    adjust: Adjust = kwargs.get("adjust", Adjust.NONE)
+    resolved_adjust_method = (
+        AdjustMethod.RAW.value
+        if adjust == Adjust.NONE
+        else (
+            adjust_method.value
+            if isinstance(adjust_method, AdjustMethod)
+            else (str(adjust_method) if adjust_method is not None else AdjustMethod.PROPORTIONAL.value)
+        )
+    )
     bars = bars_from_dataframe(dataframe, diagnostics=diagnostics, **kwargs)
     if diagnostics.filtered_rows:
         warnings = (*warnings, f"Filtered {diagnostics.filtered_rows} invalid bar row(s).")
     if diagnostics.duplicate_rows:
         warnings = (*warnings, f"Removed {diagnostics.duplicate_rows} duplicate timestamp row(s).")
+    if diagnostics.extreme_range_rows:
+        msg = (
+            f"Detected {diagnostics.extreme_range_rows} bar(s) with extreme intrabar range (>200%); "
+            "verify IPO debut or upstream spike."
+        )
+        warnings = (*warnings, msg)
     if truncated:
         warnings = (*warnings, "Provider history limit reached; the requested history is partial.")
     return SourcePayload(
@@ -68,6 +96,8 @@ def bar_payload_from_dataframe(
             duplicate_rows=diagnostics.duplicate_rows,
             truncated=truncated,
             currency={Market.CN: "CNY", Market.HK: "HKD", Market.US: "USD"}[kwargs["market"]],
+            suspended_rows=diagnostics.suspended_rows,
+            adjust_method=resolved_adjust_method,
         ),
     )
 
@@ -90,6 +120,7 @@ def bars_from_dataframe(
     intraday_timestamp_label: IntradayTimestampLabel | None = None,
     now: datetime | None = None,
     adjust: Adjust = Adjust.NONE,
+    asset_type: AssetType | None = None,
     volume_multiplier: Decimal = Decimal(1),
     diagnostics: ParseDiagnostics | None = None,
 ) -> list[AShareBar]:
@@ -109,7 +140,7 @@ def bars_from_dataframe(
     start_bj = to_beijing(start)
     end_bj = to_beijing(end)
     bars: list[AShareBar] = []
-    for _, row in dataframe.iterrows():
+    for row in dataframe.to_dict("records"):
         raw_timestamp = to_datetime(
             record_value(row, *time_columns), naive_timezone=market_timezone(market)
         )
@@ -144,6 +175,18 @@ def bars_from_dataframe(
         except DataValidationError:
             diagnostics.filtered_rows += 1
             continue
+        if (
+            interval == Interval.DAY_1
+            and asset_type != AssetType.INDEX
+            and volume is not None
+            and volume == 0
+            and (amount is None or amount == 0)
+            and open_price == high_price == low_price == close_price
+        ):
+            diagnostics.suspended_rows += 1
+            continue
+        if adjust == Adjust.NONE and low_price > 0 and high_price / low_price > Decimal(3):
+            diagnostics.extreme_range_rows += 1
         bars.append(
             AShareBar(
                 symbol=symbol,
@@ -184,7 +227,7 @@ def normalize_bar_timestamp(
     if intraday_timestamp_label is IntradayTimestampLabel.CLOSE:
         return timestamp
     if intraday_timestamp_label is IntradayTimestampLabel.OPEN:
-        return timestamp + duration
+        return to_beijing(intraday_bar_close(value, duration, market))
     raise ValueError(f"Unsupported intraday timestamp label: {intraday_timestamp_label!r}")
 
 

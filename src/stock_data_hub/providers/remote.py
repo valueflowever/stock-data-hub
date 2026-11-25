@@ -17,6 +17,7 @@ from stock_data_hub.errors import DataValidationError, ProviderUnavailable
 from stock_data_hub.models import (
     DATA_CONTRACT_VERSION,
     Adjust,
+    AdjustFactor,
     AShareBar,
     AssetType,
     BarDataQuality,
@@ -48,6 +49,7 @@ class RemoteHubProvider(MarketDataProvider):
     intervals = frozenset(Interval)
     adjustments = frozenset(Adjust)
     accepts_asset_type = True
+    accepts_us_close_adjust = True
     is_peer = True
 
     def __init__(
@@ -168,8 +170,13 @@ class RemoteHubProvider(MarketDataProvider):
         self,
         ticker: str,
         max_rows: int,
+        *,
+        adjust: Adjust = Adjust.NONE,
     ) -> SourcePayload[list[DailyClose]]:
-        body = self._get(f"/us-daily-closes/{ticker}", {"max_rows": max_rows})
+        params: dict[str, object | None] = {"max_rows": max_rows}
+        if adjust != Adjust.NONE:
+            params["adjust"] = adjust.value
+        body = self._get(f"/us-daily-closes/{ticker}", params)
         closes: list[DailyClose] = []
         for item in _data_list(body):
             try:
@@ -183,6 +190,40 @@ class RemoteHubProvider(MarketDataProvider):
             except KeyError as exc:
                 raise DataValidationError("Remote Hub returned an invalid daily close") from exc
         return _payload(body, closes, self.name)
+
+    def fetch_adjust_factors(
+        self,
+        symbol: str,
+        start: date | None = None,
+        end: date | None = None,
+    ) -> SourcePayload[list[AdjustFactor]]:
+        body = self._get(
+            f"/adjust-factors/{symbol}",
+            {
+                "start": start.isoformat() if start is not None else None,
+                "end": end.isoformat() if end is not None else None,
+                "market": market_from_symbol(symbol).value,
+            },
+        )
+        market = market_from_symbol(symbol)
+        factors: list[AdjustFactor] = []
+        for item in _data_list(body):
+            try:
+                factor = AdjustFactor(
+                    symbol=str(item["symbol"]),
+                    ex_date=_date(item["ex_date"], "ex_date"),
+                    qfq_factor=_nullable_decimal(item.get("qfq_factor"), "qfq_factor"),
+                    hfq_factor=_nullable_decimal(item.get("hfq_factor"), "hfq_factor"),
+                    market=Market(str(item.get("market", market.value))),
+                )
+            except (KeyError, ValueError) as exc:
+                raise DataValidationError("Remote Hub returned an invalid adjust factor") from exc
+            if factor.symbol != symbol or factor.market != market:
+                raise DataValidationError(
+                    "Remote Hub returned adjust factors for a different symbol or market"
+                )
+            factors.append(factor)
+        return _payload(body, factors, self.name)
 
     def fetch_snapshot(self) -> SourcePayload[Snapshot]:
         body, raw_rows = self._paged("/snapshot", "rows", "total_rows")
@@ -209,6 +250,17 @@ class RemoteHubProvider(MarketDataProvider):
                         name=str(item["name"]),
                         market=Market(str(item.get("market", "CN"))),
                         asset_type=AssetType(str(item.get("asset_type", "stock"))),
+                        status=str(item.get("status", "active")),
+                        list_date=(
+                            _date(item["list_date"], "list_date")
+                            if item.get("list_date") is not None
+                            else None
+                        ),
+                        delist_date=(
+                            _date(item["delist_date"], "delist_date")
+                            if item.get("delist_date") is not None
+                            else None
+                        ),
                     )
                 )
             except (KeyError, ValueError) as exc:
@@ -288,6 +340,11 @@ class RemoteHubProvider(MarketDataProvider):
                         symbol=str(item["symbol"]),
                         announce_date=_date(item["announce_date"], "announce date"),
                         title=str(item["title"]),
+                        published_at=(
+                            _datetime(item["published_at"], "published_at")
+                            if item.get("published_at") is not None
+                            else None
+                        ),
                     )
                 )
             except KeyError as exc:
@@ -353,6 +410,7 @@ class RemoteHubProvider(MarketDataProvider):
         if self.api_key is not None:
             headers["X-Data-Hub-Key"] = self.api_key
         request = Request(url, headers=headers, method="GET")
+        peer_label = "remote" if self.name.startswith("remote:") else self.name
         try:
             with self._opener(request, timeout=remaining_timeout(self.timeout_seconds)) as response:
                 raw = response.read(self.max_response_bytes + 1)
@@ -361,15 +419,20 @@ class RemoteHubProvider(MarketDataProvider):
                 body = json.loads(raw.decode("utf-8"))
         except DataValidationError:
             raise
+        except HTTPError as exc:
+            detail = _http_error_detail(exc)
+            raise ProviderUnavailable(
+                f"Remote Hub ({peer_label}) HTTP {exc.code} on {path}"
+                + (f": {detail}" if detail else "")
+            ) from exc
         except (
-            HTTPError,
             URLError,
             TimeoutError,
             OSError,
             UnicodeError,
             json.JSONDecodeError,
         ) as exc:
-            raise ProviderUnavailable(f"Remote Hub request failed: {url}") from exc
+            raise ProviderUnavailable(f"Remote Hub ({peer_label}) request failed on {path}") from exc
         if not isinstance(body, Mapping):
             raise DataValidationError("Remote Hub response was not a JSON object")
         if "error" in body:
@@ -478,11 +541,16 @@ def _quality(raw: object) -> BarDataQuality | None:
             truncated=_boolean(raw.get("truncated", False), "truncated"),
             volume_unit=str(raw.get("volume_unit", "shares")),
             currency=str(raw.get("currency", "CNY")),
+            suspended_rows=_nonnegative_int(raw.get("suspended_rows", 0), "suspended_rows"),
+            adjust_method=str(raw.get("adjust_method", "raw")),
         )
         if (
             result.volume_unit != "shares"
             or result.currency not in {"CNY", "HKD", "USD"}
-            or result.returned_rows + result.filtered_rows + result.duplicate_rows
+            or result.returned_rows
+            + result.filtered_rows
+            + result.duplicate_rows
+            + result.suspended_rows
             > result.input_rows
             or result.requested_start > result.requested_end
         ):
@@ -558,6 +626,25 @@ def _optional_decimal(value: object | None) -> Decimal | None:
     except (InvalidOperation, TypeError, ValueError):
         return None
     return result if result.is_finite() else None
+
+
+def _http_error_detail(exc: HTTPError) -> str:
+    try:
+        raw = exc.read(4096)
+        if not raw:
+            return ""
+        body = json.loads(raw.decode("utf-8", errors="replace"))
+        if isinstance(body, Mapping):
+            error = body.get("error")
+            if isinstance(error, Mapping):
+                kind = error.get("type", "")
+                message = error.get("message", "")
+                return f"{kind}: {message}".strip(": ")
+            if "detail" in body:
+                return str(body["detail"])
+        return raw.decode("utf-8", errors="replace").strip()[:200]
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 def _optional_text(value: object | None) -> str | None:

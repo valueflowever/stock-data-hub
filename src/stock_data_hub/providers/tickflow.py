@@ -3,19 +3,19 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from contextlib import redirect_stdout, suppress
+from contextlib import suppress
 from datetime import datetime, timedelta
 from decimal import Decimal
-from io import StringIO
 from math import isfinite
 from typing import Any
 
 import pandas as pd
 
-from stock_data_hub._workers import remaining_timeout
+from stock_data_hub._workers import remaining_timeout, suppress_thread_stdout
 from stock_data_hub.errors import DataValidationError, ProviderUnavailable
 from stock_data_hub.models import (
     Adjust,
+    AdjustMethod,
     AShareBar,
     AssetType,
     Capability,
@@ -23,7 +23,7 @@ from stock_data_hub.models import (
     Market,
     SourcePayload,
 )
-from stock_data_hub.normalization import market_from_symbol
+from stock_data_hub.normalization import asset_type_from_symbol, market_from_symbol
 from stock_data_hub.providers._parsing import bar_payload_from_dataframe, record_value, to_datetime
 from stock_data_hub.providers.base import MarketDataProvider
 from stock_data_hub.trading_sessions import market_timezone
@@ -38,6 +38,7 @@ class TickFlowProvider(MarketDataProvider):
     intervals = frozenset({Interval.DAY_1, Interval.WEEK_1, Interval.MONTH_1})
     adjustments = frozenset({Adjust.QFQ, Adjust.HFQ, Adjust.NONE})
     capabilities = frozenset({Capability.BARS})
+    supports_intraday_daily_bar = False
 
     def __init__(
         self,
@@ -97,7 +98,7 @@ class TickFlowProvider(MarketDataProvider):
                 loaded += len(dataframe)
                 stamps = [
                     stamp
-                    for _, row in dataframe.iterrows()
+                    for row in dataframe.to_dict("records")
                     if (
                         stamp := to_datetime(
                             record_value(row, "timestamp", "trade_date"), naive_timezone=zone
@@ -129,6 +130,7 @@ class TickFlowProvider(MarketDataProvider):
             source="tickflow:free",
             warnings=("TickFlow free service returns historical bars only.",),
             truncated=truncated,
+            adjust_method=AdjustMethod.PROPORTIONAL,
             symbol=symbol,
             interval=interval,
             start=start,
@@ -136,6 +138,7 @@ class TickFlowProvider(MarketDataProvider):
             market=market,
             time_columns=("trade_date", "timestamp"),
             adjust=adjust,
+            asset_type=asset_type_from_symbol(symbol),
             # TickFlow free CN history retains Eastmoney lots; HK/US use shares.
             volume_multiplier=Decimal(100) if market == Market.CN else Decimal(1),
         )
@@ -149,10 +152,11 @@ class TickFlowProvider(MarketDataProvider):
             raise ProviderUnavailable(
                 "TickFlow is not installed. Install stock-data-hub[sources]."
             ) from exc
-        # TickFlow's free constructor prints an emoji notice.  Redirecting it
-        # avoids a UnicodeEncodeError in Windows consoles using GBK.
-        with redirect_stdout(StringIO()):
-            return TickFlow.free(timeout=self._timeout_seconds, max_retries=0)
+        # TickFlow's free constructor prints an emoji notice. Suppressing stdout
+        # per-thread avoids both Windows GBK UnicodeEncodeError and sys.stdout races.
+        timeout = remaining_timeout(self._timeout_seconds)
+        with suppress_thread_stdout():
+            return TickFlow.free(timeout=timeout, max_retries=0)
 
 
 _TICKFLOW_PERIODS = {
