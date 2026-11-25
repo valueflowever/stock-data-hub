@@ -3,16 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import random
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from math import isfinite
 from threading import Lock
 from time import perf_counter
 from typing import TypeVar
 
 from stock_data_hub._workers import BoundedWorkers, WorkerBusy
-from stock_data_hub.cache import InMemoryResultCache
+from stock_data_hub.cache import InMemoryResultCache, ResultCache
 from stock_data_hub.errors import (
     AllSourcesFailed,
     DataHubError,
@@ -25,6 +27,7 @@ from stock_data_hub.errors import (
 from stock_data_hub.health import ProviderHealth, SourceHealthRegistry
 from stock_data_hub.models import (
     Adjust,
+    AdjustFactor,
     AShareBar,
     AssetType,
     BarDataQuality,
@@ -48,12 +51,22 @@ from stock_data_hub.models import (
 from stock_data_hub.normalization import (
     BEIJING_TZ,
     asset_type_from_symbol,
+    is_bar_closed,
     market_from_symbol,
     normalize_a_share_symbol,
+    normalize_asset_type,
+    normalize_market,
     normalize_symbol,
     to_beijing,
 )
 from stock_data_hub.providers.base import MarketDataProvider
+from stock_data_hub.trading_sessions import (
+    latest_active_session_date,
+    period_end,
+    window_has_trading_session,
+)
+
+logger = logging.getLogger("stock_data_hub")
 
 
 @dataclass(frozen=True)
@@ -81,6 +94,7 @@ DEFAULT_CACHE_POLICIES: Mapping[Capability, CachePolicy] = {
     Capability.RESTRICTED_RELEASES: CachePolicy(timedelta(minutes=30), timedelta(hours=12)),
     Capability.DISCLOSURES: CachePolicy(timedelta(minutes=5), timedelta(hours=2)),
     Capability.US_DAILY_CLOSES: CachePolicy(timedelta(minutes=30), timedelta(hours=12)),
+    Capability.ADJUST_FACTORS: CachePolicy(timedelta(hours=12), timedelta(days=7)),
 }
 
 T = TypeVar("T")
@@ -106,7 +120,7 @@ class DataHub:
         providers: Iterable[MarketDataProvider] = (),
         *,
         source_priority: Mapping[Capability | str | RouteKey, Sequence[str]] | None = None,
-        cache: InMemoryResultCache | None = None,
+        cache: ResultCache | None = None,
         cache_policies: Mapping[Capability | str, CachePolicy] | None = None,
         attempts_per_provider: int = 2,
         retry_delay_seconds: float = 0.15,
@@ -114,7 +128,9 @@ class DataHub:
         circuit_cooldown: timedelta = timedelta(seconds=30),
         provider_timeout_seconds: float | None = 20.0,
         provider_timeout_overrides: Mapping[Capability | str, float | None] | None = None,
+        provider_queue_timeout_seconds: float = 2.0,
         max_concurrent_requests: int = 8,
+        provider_rate_limits: Mapping[str, float] | None = None,
         request_timeout_seconds: float = 240.0,
         local_timeout_seconds: float = 90.0,
         peer_timeout_seconds: float = 95.0,
@@ -128,6 +144,8 @@ class DataHub:
             not isfinite(provider_timeout_seconds) or provider_timeout_seconds <= 0
         ):
             raise ValueError("provider_timeout_seconds must be positive or None")
+        if not isfinite(provider_queue_timeout_seconds) or provider_queue_timeout_seconds < 0:
+            raise ValueError("provider_queue_timeout_seconds must be finite and nonnegative")
         normalized_timeout_overrides: dict[Capability, float | None] = {}
         for raw_capability, timeout_seconds in (provider_timeout_overrides or {}).items():
             capability = Capability(raw_capability)
@@ -146,6 +164,12 @@ class DataHub:
         if max_inflight_requests < 1:
             raise ValueError("max_inflight_requests must be positive")
 
+        normalized_rate_limits: dict[str, float] = {}
+        for raw_provider, rps in (provider_rate_limits or {}).items():
+            if not isfinite(rps) or rps <= 0:
+                raise ValueError("provider_rate_limits values must be finite and positive")
+            normalized_rate_limits[str(raw_provider).strip()] = float(rps)
+
         self._providers: dict[str, MarketDataProvider] = {}
         self._source_priority = _normalize_priority(source_priority)
         self._cache_policies = _merge_cache_policies(cache_policies)
@@ -154,7 +178,9 @@ class DataHub:
         self._retry_delay_seconds = retry_delay_seconds
         self._provider_timeout_seconds = provider_timeout_seconds
         self._provider_timeout_overrides = normalized_timeout_overrides
+        self._provider_queue_timeout_seconds = provider_queue_timeout_seconds
         self._worker_capacity = max_concurrent_requests
+        self._provider_rate_limits = normalized_rate_limits
         self._workers: dict[str, BoundedWorkers] = {}
         self._request_timeout_seconds = request_timeout_seconds
         self._local_timeout_seconds = local_timeout_seconds
@@ -188,13 +214,22 @@ class DataHub:
         if name in self._providers:
             raise ValueError(f"A provider named {name!r} is already registered")
         self._providers[name] = provider
-        self._workers[name] = BoundedWorkers(self._worker_capacity, name=f"data-hub:{name}")
+        self._workers[name] = BoundedWorkers(
+            self._worker_capacity,
+            name=f"data-hub:{name}",
+            max_rps=self._provider_rate_limits.get(name),
+        )
         self._health.ensure(name)
 
     def clear_cache(self) -> None:
         self._cache.clear()
         for provider in self._providers.values():
             provider.clear_cache()
+
+    def close(self) -> None:
+        close_cache = getattr(self._cache, "close", None)
+        if callable(close_cache):
+            close_cache()
 
     def health(self) -> tuple[ProviderHealth, ...]:
         return self._health.snapshots()
@@ -225,10 +260,7 @@ class DataHub:
         normalized_interval = Interval(interval)
         normalized_adjust = Adjust(adjust)
         normalized_asset_type = asset_type_from_symbol(normalized, asset_type)
-        start_bj = to_beijing(start)
-        end_bj = to_beijing(end)
-        if start_bj > end_bj:
-            raise ValueError("start must be before end")
+        start_bj, end_bj = normalize_bar_window(start, end, normalized_interval)
         return await self._resolve(
             Capability.BARS,
             _cache_key(
@@ -254,6 +286,7 @@ class DataHub:
             interval=normalized_interval,
             adjust=normalized_adjust,
             allow_peers=allow_peers,
+            bar_end=end_bj,
         )
 
     async def get_quote(
@@ -294,8 +327,8 @@ class DataHub:
         """Fetch up to 100 quotes; preserve individual failures and routing metadata."""
         if isinstance(symbols, str) or not 1 <= len(symbols) <= 100:
             raise ValueError("Provide between 1 and 100 symbols")
-        normalized_market = Market(market) if market is not None else None
-        normalized_asset = AssetType(asset_type) if asset_type is not None else None
+        normalized_market = normalize_market(market)
+        normalized_asset = normalize_asset_type(asset_type)
         entries: dict[str, BatchQuoteItem | None] = {}
         for symbol in symbols:
             try:
@@ -305,6 +338,15 @@ class DataHub:
                     symbol,
                     BatchQuoteItem(symbol, error=BatchQuoteError(type(exc).__name__, str(exc))),
                 )
+
+        valid_symbols = [symbol for symbol, item in entries.items() if item is None]
+        if len(valid_symbols) > 1:
+            await self._prefetch_batch_quotes(
+                valid_symbols,
+                asset_type=normalized_asset,
+                allow_peers=allow_peers,
+            )
+
         gate = asyncio.Semaphore(8)
 
         async def fetch(symbol: str) -> BatchQuoteItem:
@@ -323,6 +365,71 @@ class DataHub:
                     )
 
         return list(await asyncio.gather(*(fetch(symbol) for symbol in entries)))
+
+    async def _prefetch_batch_quotes(
+        self,
+        symbols: Sequence[str],
+        *,
+        asset_type: AssetType | None,
+        allow_peers: bool,
+    ) -> None:
+        grouped: dict[tuple[Market, AssetType], list[str]] = {}
+        for symbol in symbols:
+            resolved_asset = asset_type_from_symbol(symbol, asset_type)
+            raw_key = _cache_key(Capability.QUOTE, symbol, resolved_asset.value)
+            if self._cache_get_fresh(raw_key, allow_peers=allow_peers) is not None:
+                continue
+            grouped.setdefault((market_from_symbol(symbol), resolved_asset), []).append(symbol)
+
+        tasks = []
+        for (group_market, group_asset), group_symbols in grouped.items():
+            if len(group_symbols) < 2:
+                continue
+            route = _health_route(Capability.QUOTE, group_market, group_asset, None, None)
+            providers = self._providers_for(
+                Capability.QUOTE,
+                market=group_market,
+                asset_type=group_asset,
+                allow_peers=allow_peers,
+            )
+            for provider in providers:
+                if not provider.supports_batch_quotes or not self._health.can_attempt(
+                    provider.name, route
+                ):
+                    continue
+                timeout_seconds = (
+                    self._peer_timeout_seconds
+                    if provider.is_peer
+                    else self._provider_timeout_overrides.get(
+                        Capability.QUOTE, self._provider_timeout_seconds
+                    )
+                )
+
+                async def warm(
+                    target_provider: MarketDataProvider = provider,
+                    target_symbols: list[str] = group_symbols,
+                    target_asset: AssetType = group_asset,
+                    target_timeout: float | None = timeout_seconds,
+                ) -> None:
+                    try:
+                        await self._workers[target_provider.name].run(
+                            lambda: target_provider.prefetch_quotes(
+                                target_symbols, asset_type=target_asset
+                            ),
+                            timeout=target_timeout,
+                            queue_timeout=self._queue_timeout(target_timeout),
+                        )
+                    except Exception as exc:  # noqa: BLE001 - best-effort pre-warm only
+                        logger.debug(
+                            "Batch quote prefetch skipped for %s: %s",
+                            target_provider.name,
+                            _short_error(exc),
+                        )
+
+                tasks.append(warm())
+                break
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def get_instruments(self, *, allow_peers: bool = True) -> DataResult[list[Instrument]]:
         return await self._resolve(
@@ -395,17 +502,73 @@ class DataHub:
         ticker: str,
         max_rows: int = 80,
         *,
+        adjust: Adjust | str = Adjust.NONE,
         allow_peers: bool = True,
     ) -> DataResult[list[DailyClose]]:
         normalized = normalize_symbol(ticker, Market.US).removesuffix(".US")
+        normalized_adjust = Adjust(adjust)
         if max_rows < 1:
             raise ValueError("max_rows must be positive")
         return await self._resolve(
             Capability.US_DAILY_CLOSES,
-            _cache_key(Capability.US_DAILY_CLOSES, normalized, str(max_rows)),
-            lambda provider: _fetch_us_daily_closes(provider, normalized, max_rows),
+            _cache_key(
+                Capability.US_DAILY_CLOSES, normalized, str(max_rows), normalized_adjust.value
+            ),
+            lambda provider: _fetch_us_daily_closes(
+                provider, normalized, max_rows, normalized_adjust
+            ),
+            market=Market.US,
+            adjust=normalized_adjust,
             allow_peers=allow_peers,
         )
+
+    async def get_adjust_factors(
+        self,
+        symbol: str,
+        start: date | None = None,
+        end: date | None = None,
+        market: Market | str | None = None,
+        *,
+        allow_peers: bool = True,
+    ) -> DataResult[list[AdjustFactor]]:
+        if start is not None and end is not None and start > end:
+            raise ValueError("start must be before end")
+        normalized = normalize_symbol(symbol, market)
+        normalized_market = market_from_symbol(normalized)
+        normalized_asset = asset_type_from_symbol(normalized)
+        return await self._resolve(
+            Capability.ADJUST_FACTORS,
+            _cache_key(
+                Capability.ADJUST_FACTORS,
+                normalized,
+                start.isoformat() if start is not None else "",
+                end.isoformat() if end is not None else "",
+            ),
+            lambda provider: _fetch_adjust_factors(provider, normalized, start, end),
+            market=normalized_market,
+            asset_type=normalized_asset,
+            allow_peers=allow_peers,
+        )
+
+    def _cache_get_fresh(
+        self,
+        raw_cache_key: str,
+        *,
+        allow_peers: bool,
+        interval: Interval | None = None,
+    ) -> object | None:
+        candidate = self._cache.get_fresh(_local_cache_key(raw_cache_key))
+        if candidate is None and allow_peers:
+            candidate = self._cache.get_fresh(_peer_cache_key(raw_cache_key))
+        if candidate is not None and _has_newly_closed_bar(candidate, interval):
+            return None
+        return candidate
+
+    def _cache_get_stale(self, raw_cache_key: str, *, allow_peers: bool) -> object | None:
+        candidate = self._cache.get_stale(_local_cache_key(raw_cache_key))
+        if candidate is None and allow_peers:
+            candidate = self._cache.get_stale(_peer_cache_key(raw_cache_key))
+        return candidate
 
     async def _resolve(
         self,
@@ -417,16 +580,18 @@ class DataHub:
         interval: Interval | None = None,
         adjust: Adjust | None = None,
         allow_peers: bool = True,
+        bar_end: datetime | None = None,
     ) -> DataResult[T]:
         self._count("requests")
-        cache_key = _scoped_cache_key(cache_key, allow_peers)
-        fresh = self._cache.get_fresh(cache_key)
+        raw_cache_key = cache_key
+        scoped_cache_key = _scoped_cache_key(raw_cache_key, allow_peers)
+        fresh = self._cache_get_fresh(raw_cache_key, allow_peers=allow_peers, interval=interval)
         if fresh is not None:
             self._count("cache_hits")
             return _cached_result(fresh, stale=False)
 
         loop = asyncio.get_running_loop()
-        inflight_key = (id(loop), cache_key)
+        inflight_key = (id(loop), scoped_cache_key)
         with self._inflight_lock:
             shared = self._inflight.get(inflight_key)
             if shared is None:
@@ -436,13 +601,15 @@ class DataHub:
                 shared = loop.create_task(
                     self._resolve_uncached(
                         capability,
-                        cache_key,
+                        raw_cache_key,
+                        scoped_cache_key,
                         invoke,
                         market=market,
                         asset_type=asset_type,
                         interval=interval,
                         adjust=adjust,
                         allow_peers=allow_peers,
+                        bar_end=bar_end,
                     )
                 )
                 self._inflight[inflight_key] = shared
@@ -469,6 +636,7 @@ class DataHub:
     async def _resolve_uncached(
         self,
         capability: Capability,
+        raw_cache_key: str,
         cache_key: str,
         invoke: Callable[[MarketDataProvider], SourcePayload[T]],
         *,
@@ -477,6 +645,7 @@ class DataHub:
         interval: Interval | None,
         adjust: Adjust | None,
         allow_peers: bool,
+        bar_end: datetime | None,
     ) -> DataResult[T]:
         started_at = perf_counter()
         deadline = started_at + self._request_timeout_seconds
@@ -491,15 +660,25 @@ class DataHub:
         )
         health_route = _health_route(capability, market, asset_type, interval, adjust)
         if not providers:
-            stale = self._cache.get_stale(cache_key)
+            stale = self._cache_get_stale(raw_cache_key, allow_peers=allow_peers)
             if stale is not None:
                 return _cached_result(stale, stale=True)
             raise NoProviderConfigured(f"No provider supports {capability.value}")
 
+        active_session = (
+            latest_active_session_date(market)
+            if (
+                capability is Capability.BARS
+                and interval in {Interval.DAY_1, Interval.WEEK_1, Interval.MONTH_1}
+                and market is not None
+                and bar_end is not None
+            )
+            else None
+        )
         errors: dict[str, str] = {}
         attempted: list[str] = []
         empty_candidate: tuple[MarketDataProvider, SourcePayload[T], float] | None = None
-        partial_candidate: tuple[MarketDataProvider, SourcePayload[T], float] | None = None
+        partial_candidate: tuple[MarketDataProvider, SourcePayload[T], float, bool] | None = None
         all_empty = True
         for provider in providers:
             provider_deadline = deadline if provider.is_peer else local_deadline
@@ -507,35 +686,72 @@ class DataHub:
                 errors[provider.name] = "routing deadline exhausted"
                 all_empty = False
                 continue
-            if not self._health.can_attempt(provider.name, health_route):
+            allowed, is_probe = self._health.try_acquire_attempt(provider.name, health_route)
+            if not allowed:
                 errors[provider.name] = "circuit breaker is open"
                 all_empty = False
                 continue
 
             attempted.append(provider.name)
-            payload, latency_ms, error = await self._attempt_provider(
-                provider,
-                invoke,
-                health_route,
-                capability,
-                provider_deadline,
-            )
+            try:
+                payload, latency_ms, error = await self._attempt_provider(
+                    provider,
+                    invoke,
+                    health_route,
+                    capability,
+                    provider_deadline,
+                )
+            finally:
+                if is_probe:
+                    self._health.finish_probe(provider.name, health_route)
+
             if error is None and payload is not None:
                 if payload.fetched_at is not None:
                     age = datetime.now(tz=BEIJING_TZ) - to_beijing(payload.fetched_at)
                     if age >= self._cache_policies[capability].ttl:
                         payload = replace(payload, stale=True)
-                if payload.stale or (
-                    payload.quality is not None
-                    and (payload.quality.truncated or payload.quality.filtered_rows)
-                ):
-                    partial_candidate = partial_candidate or (provider, payload, latency_ms)
+                has_quality_issue = payload.quality is not None and (
+                    payload.quality.truncated or payload.quality.filtered_rows > 0
+                )
+                is_eod_lag = (
+                    active_session is not None
+                    and interval is not None
+                    and bar_end is not None
+                    and not provider.supports_intraday_daily_bar
+                    and period_end(bar_end.date(), interval) >= active_session
+                    and isinstance(payload.value, list)
+                    and bool(payload.value)
+                    and isinstance(payload.value[-1], AShareBar)
+                    and period_end(payload.value[-1].ts.date(), interval) < active_session
+                )
+                if payload.stale or has_quality_issue or is_eod_lag:
+                    candidate_payload = payload
+                    if is_eod_lag:
+                        warning = "EOD-only source may be missing the latest active trading session."
+                        if warning not in candidate_payload.warnings:
+                            candidate_payload = replace(
+                                candidate_payload,
+                                warnings=(*candidate_payload.warnings, warning),
+                            )
+                    candidate = (provider, candidate_payload, latency_ms, is_eod_lag)
+                    partial_candidate = _pick_better_partial(partial_candidate, candidate)
                     all_empty = False
+                    logger.info(
+                        "Deferring partial/stale/EOD result from %s on %s; trying fallback",
+                        provider.name,
+                        health_route,
+                    )
                     continue
                 if len(attempted) > 1:
                     self._count("fallbacks")
+                    logger.info(
+                        "Fallback succeeded via %s on %s after %s",
+                        provider.name,
+                        health_route,
+                        ",".join(attempted[:-1]),
+                    )
                 return self._store_result(
-                    capability, cache_key, provider, payload, attempted, started_at
+                    capability, raw_cache_key, cache_key, provider, payload, attempted, started_at
                 )
 
             assert error is not None
@@ -544,21 +760,42 @@ class DataHub:
                 empty_candidate = (provider, payload, latency_ms)
             else:
                 all_empty = False
+                if not isinstance(error, UnsupportedCapability):
+                    logger.warning(
+                        "Provider %s failed on %s: %s",
+                        provider.name,
+                        health_route,
+                        errors[provider.name],
+                    )
 
-        stale = self._cache.get_stale(cache_key)
-        if stale is not None:
+        stale = self._cache_get_stale(raw_cache_key, allow_peers=allow_peers)
+        partial_is_fresh_eod = (
+            partial_candidate is not None
+            and partial_candidate[3]
+            and not partial_candidate[1].stale
+            and not (
+                partial_candidate[1].quality is not None
+                and (
+                    partial_candidate[1].quality.truncated
+                    or partial_candidate[1].quality.filtered_rows > 0
+                )
+            )
+        )
+        if stale is not None and not partial_is_fresh_eod:
             return _cached_result(
                 stale,
                 stale=True,
                 warning="All live sources failed; returned the last verified cached result.",
             )
         if partial_candidate is not None:
-            provider, payload, _ = partial_candidate
+            provider, payload, _, _ = partial_candidate
+            if len(attempted) > 1 and attempted[0] != provider.name:
+                self._count("fallbacks")
             payload = replace(
                 payload, warnings=(*payload.warnings, "No complete fresh source was available.")
             )
             return self._store_result(
-                capability, cache_key, provider, payload, attempted, started_at
+                capability, raw_cache_key, cache_key, provider, payload, attempted, started_at
             )
         if empty_candidate is not None and all_empty:
             provider, payload, _ = empty_candidate
@@ -570,13 +807,14 @@ class DataHub:
                 ),
             )
             return self._store_result(
-                capability, cache_key, provider, payload, attempted, started_at
+                capability, raw_cache_key, cache_key, provider, payload, attempted, started_at
             )
         raise AllSourcesFailed(capability, errors)
 
     def _store_result(
         self,
         capability: Capability,
+        raw_cache_key: str,
         cache_key: str,
         provider: MarketDataProvider,
         payload: SourcePayload[T],
@@ -609,10 +847,20 @@ class DataHub:
         fresh_remaining = max(policy.ttl - age_delta, timedelta())
         if payload.stale:
             fresh_remaining = timedelta()
+        elif (
+            capability is Capability.BARS
+            and isinstance(payload.value, list)
+            and any(isinstance(bar, AShareBar) and not bar.is_closed for bar in payload.value)
+        ):
+            # Developing intraday/current-session bars must never stay cached as
+            # fresh for 15 minutes across the session close.
+            fresh_remaining = min(fresh_remaining, timedelta(seconds=15))
         total_remaining = max(policy.ttl + policy.stale_ttl - age_delta, timedelta())
-        self._cache.set(
-            cache_key, result, fresh_remaining, max(total_remaining - fresh_remaining, timedelta())
+        stale_remaining = max(total_remaining - fresh_remaining, timedelta())
+        target_key = (
+            _peer_cache_key(raw_cache_key) if provider.is_peer else _local_cache_key(raw_cache_key)
         )
+        self._cache.set(target_key, result, fresh_remaining, stale_remaining)
         return result
 
     async def _attempt_provider(
@@ -671,15 +919,18 @@ class DataHub:
                 total_latency_ms += (perf_counter() - started_at) * 1000
                 last_error = exc
             if attempt + 1 < self._attempts_per_provider and self._retry_delay_seconds:
-                await asyncio.sleep(
-                    min(
-                        self._retry_delay_seconds * (attempt + 1), max(deadline - perf_counter(), 0)
-                    )
-                )
+                base_delay = self._retry_delay_seconds * (2**attempt)
+                jitter = random.uniform(0.0, base_delay * 0.25)
+                await asyncio.sleep(min(base_delay + jitter, max(deadline - perf_counter(), 0)))
 
         assert last_error is not None
         self._health.record_failure(provider.name, health_route, last_error)
         return None, total_latency_ms, last_error
+
+    def _queue_timeout(self, timeout_seconds: float | None) -> float:
+        if timeout_seconds is None:
+            return self._provider_queue_timeout_seconds
+        return min(self._provider_queue_timeout_seconds, timeout_seconds * 0.25)
 
     async def _invoke_provider(
         self,
@@ -690,7 +941,7 @@ class DataHub:
         return await self._workers[provider.name].run(
             lambda: invoke(provider),
             timeout=timeout_seconds,
-            queue_timeout=min(0.05, timeout_seconds) if timeout_seconds else 0.05,
+            queue_timeout=self._queue_timeout(timeout_seconds),
         )
 
     def _providers_for(
@@ -783,6 +1034,28 @@ def _cache_key(capability: Capability, *parts: str) -> str:
 
 def _scoped_cache_key(cache_key: str, allow_peers: bool) -> str:
     return cache_key if allow_peers else f"{cache_key}|scope:local-only"
+
+
+def _local_cache_key(raw_cache_key: str) -> str:
+    return f"{raw_cache_key}|scope:local-only"
+
+
+def _peer_cache_key(raw_cache_key: str) -> str:
+    return f"{raw_cache_key}|scope:peer"
+
+
+def _has_newly_closed_bar(cached: object, interval: Interval | None) -> bool:
+    if interval is None or not isinstance(cached, DataResult) or not isinstance(cached.value, list):
+        return False
+    now = datetime.now(tz=BEIJING_TZ)
+    for item in cached.value:
+        if (
+            isinstance(item, AShareBar)
+            and not item.is_closed
+            and is_bar_closed(item.ts, interval, now=now, market=item.market)
+        ):
+            return True
+    return False
 
 
 def _health_route(
@@ -908,7 +1181,7 @@ def _fetch_bars(
         raise DataValidationError(
             "Provider returned no usable bars from incomplete or invalid history"
         )
-    if not payload.value and _bar_window_requires_data(start, end):
+    if not payload.value and _bar_window_requires_data(start, end, market_from_symbol(symbol)):
         raise _EmptyBarsResult(payload)
     return payload
 
@@ -936,22 +1209,106 @@ def _fetch_us_daily_closes(
     provider: MarketDataProvider,
     ticker: str,
     max_rows: int,
+    adjust: Adjust = Adjust.NONE,
 ) -> SourcePayload[list[DailyClose]]:
-    payload = provider.fetch_us_daily_closes(ticker, max_rows)
+    if provider.accepts_us_close_adjust:
+        payload = provider.fetch_us_daily_closes(ticker, max_rows, adjust=adjust)
+    elif adjust == Adjust.NONE:
+        payload = provider.fetch_us_daily_closes(ticker, max_rows)
+    else:
+        raise UnsupportedCapability(f"{provider.name} does not support adjusted US daily closes")
     if not payload.value:
         raise ProviderUnavailable(f"{provider.name} returned no US daily closes for {ticker}")
     return payload
 
 
-def _bar_window_requires_data(start: datetime, end: datetime) -> bool:
-    """Distinguish an upstream empty response from a weekend/future query."""
+def _fetch_adjust_factors(
+    provider: MarketDataProvider,
+    symbol: str,
+    start: date | None,
+    end: date | None,
+) -> SourcePayload[list[AdjustFactor]]:
+    payload = provider.fetch_adjust_factors(symbol, start, end)
+    if not isinstance(payload, SourcePayload) or not isinstance(payload.value, list):
+        raise DataValidationError("Provider adjust factors must be a SourcePayload containing a list")
+    expected_market = market_from_symbol(symbol)
+    for factor in payload.value:
+        if (
+            not isinstance(factor, AdjustFactor)
+            or factor.symbol != symbol
+            or factor.market != expected_market
+        ):
+            raise DataValidationError("Provider returned adjust factors for a different symbol or market")
+        if factor.qfq_factor is None and factor.hfq_factor is None:
+            raise DataValidationError("Provider returned an empty adjust factor row")
+        if any(
+            val is not None and (not val.is_finite() or val <= 0)
+            for val in (factor.qfq_factor, factor.hfq_factor)
+        ):
+            raise DataValidationError("Provider returned a non-positive or non-finite adjust factor")
+        if (start is not None and factor.ex_date < start) or (
+            end is not None and factor.ex_date > end
+        ):
+            raise DataValidationError("Provider returned an adjust factor outside the requested window")
+    if len({item.ex_date for item in payload.value}) != len(payload.value):
+        raise DataValidationError("Provider returned duplicate adjust factor dates")
+    return replace(payload, value=sorted(payload.value, key=lambda item: item.ex_date))
 
-    today = datetime.now(tz=BEIJING_TZ).date()
-    first_day = to_beijing(start).date()
-    last_day = min(to_beijing(end).date(), today)
-    if first_day > last_day:
-        return False
-    # Any seven-day span contains a weekday. Short spans only need a bounded
-    # scan, so very large historical requests remain constant-time.
-    days = min((last_day - first_day).days, 6)
-    return any((first_day + timedelta(days=offset)).weekday() < 5 for offset in range(days + 1))
+
+def normalize_bar_window(
+    start: datetime,
+    end: datetime,
+    interval: Interval,
+) -> tuple[datetime, datetime]:
+    """Normalize bar boundaries to Beijing time and date labels for daily+ intervals."""
+
+    start_bj = to_beijing(start)
+    end_bj = to_beijing(end)
+    if start_bj > end_bj:
+        raise ValueError("start must be before end")
+    if interval in {Interval.DAY_1, Interval.WEEK_1, Interval.MONTH_1}:
+        start_day = start.date()
+        end_day = end.date()
+        if start_day > end_day:
+            start_day, end_day = start_bj.date(), end_bj.date()
+        return (
+            datetime.combine(start_day, time.min, tzinfo=BEIJING_TZ),
+            datetime.combine(end_day, time.min, tzinfo=BEIJING_TZ),
+        )
+    return start_bj, end_bj
+
+
+def _pick_better_partial(
+    existing: tuple[MarketDataProvider, SourcePayload[T], float, bool] | None,
+    incoming: tuple[MarketDataProvider, SourcePayload[T], float, bool],
+) -> tuple[MarketDataProvider, SourcePayload[T], float, bool]:
+    if existing is None:
+        return incoming
+    return incoming if _partial_rank(incoming) > _partial_rank(existing) else existing
+
+
+def _partial_rank(
+    candidate: tuple[MarketDataProvider, SourcePayload[T], float, bool],
+) -> tuple[int, int, int, float, int]:
+    _, payload, _, _ = candidate
+    quality = payload.quality
+    not_stale = int(not payload.stale)
+    not_truncated = int(not (quality.truncated if quality is not None else False))
+    negative_filtered = -(quality.filtered_rows if quality is not None else 0)
+    available_end_ts = (
+        quality.available_end.timestamp()
+        if quality is not None and quality.available_end is not None
+        else (payload.fetched_at.timestamp() if payload.fetched_at is not None else 0.0)
+    )
+    returned_rows = quality.returned_rows if quality is not None else 0
+    return (not_stale, not_truncated, negative_filtered, available_end_ts, returned_rows)
+
+
+def _bar_window_requires_data(
+    start: datetime,
+    end: datetime,
+    market: Market = Market.CN,
+) -> bool:
+    """Distinguish an upstream empty response from a holiday/weekend/future query."""
+
+    return window_has_trading_session(start, end, market)
