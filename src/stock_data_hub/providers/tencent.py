@@ -135,7 +135,7 @@ class TencentQuoteProvider(MarketDataProvider):
             url,
             headers={
                 "Accept": "text/plain,*/*",
-                "User-Agent": "stock-data-hub/0.7",
+                "User-Agent": "stock-data-hub/0.7.1",
             },
             method="GET",
         )

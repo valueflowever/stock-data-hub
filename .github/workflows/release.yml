@@ -1,0 +1,96 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing Git tag to publish (e.g. v0.7.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build & Publish GitHub Release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Verify tag matches package version and extract changelog
+        id: meta
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          python - <<'PY'
+          import os
+          import pathlib
+          import re
+          import tomllib
+
+          event_name = os.environ.get("GITHUB_EVENT_NAME", "")
+          tag = (
+              os.environ["INPUT_TAG"].strip()
+              if event_name == "workflow_dispatch"
+              else os.environ["GITHUB_REF_NAME"].strip()
+          )
+          if not tag.startswith("v"):
+              raise SystemExit(f"Release tag must start with 'v', got {tag!r}")
+          expected_version = tag[1:]
+
+          pyproject = tomllib.loads(pathlib.Path("pyproject.toml").read_text(encoding="utf-8"))
+          actual_version = pyproject["project"]["version"]
+          if actual_version != expected_version:
+              raise SystemExit(
+                  f"Tag {tag} does not match pyproject.toml version {actual_version}"
+              )
+
+          changelog = pathlib.Path("CHANGELOG.md").read_text(encoding="utf-8")
+          pattern = re.compile(
+              rf"^##\s+{re.escape(expected_version)}\b[^\n]*\n(.*?)(?=^##\s+|\Z)",
+              re.MULTILINE | re.DOTALL,
+          )
+          match = pattern.search(changelog)
+          notes = (
+              match.group(1).strip()
+              if match
+              else f"Release {tag} of stock-data-hub."
+          )
+          pathlib.Path("release_notes.md").write_text(notes + "\n", encoding="utf-8")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write(f"tag={tag}\n")
+          PY
+
+      - name: Lint and build wheel and sdist
+        run: |
+          rm -rf dist build
+          python -m pip install build ruff
+          python -m ruff check src tests
+          python -m build
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+            gh release edit "$TAG" --title "stock-data-hub ${TAG}" --notes-file release_notes.md
+          else
+            gh release create "$TAG" dist/* \
+              --verify-tag \
+              --title "stock-data-hub ${TAG}" \
+              --notes-file release_notes.md
+          fi
