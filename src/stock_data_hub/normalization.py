@@ -39,7 +39,7 @@ def normalize_a_share_symbol(raw: str) -> str:
 
 
 def prefixed_a_share_symbol(symbol: str) -> str:
-    normalized = normalize_a_share_symbol(symbol)
+    normalized = normalize_symbol(symbol, Market.CN)
     code, suffix = normalized.split(".", maxsplit=1)
     return f"{suffix.lower()}{code}"
 
@@ -86,6 +86,8 @@ def normalize_symbol(raw: str, market: Market | str | None = None) -> str:
         return f"{value.zfill(5)}.HK"
     if requested_market == Market.US:
         return _normalize_us_symbol(value)
+    if requested_market in (None, Market.CN) and re.fullmatch(r"SH000\d{3}", value):
+        return f"{value[2:]}.SH"
     if requested_market in (None, Market.CN) and re.fullmatch(r"(?:SH|SZ|BJ)?\d{6}", value):
         return normalize_a_share_symbol(value)
     if requested_market is None:
@@ -119,8 +121,10 @@ def asset_type_from_symbol(
     if market_from_symbol(normalized) != Market.CN:
         return AssetType.STOCK
     code, exchange = normalized.split(".", maxsplit=1)
-    if (exchange == "SH" and code.startswith("000")) or (
-        exchange == "SZ" and code.startswith("399")
+    if (
+        (exchange == "SH" and code.startswith("000"))
+        or (exchange == "SZ" and code.startswith("399"))
+        or (exchange == "BJ" and code.startswith("899"))
     ):
         return AssetType.INDEX
     if code.startswith(("15", "16", "18", "50", "51", "52", "53", "56", "58")):
@@ -143,6 +147,10 @@ def normalize_asset_type(value: AssetType | str | None) -> AssetType | None:
         return aliases[str(value).strip().upper()]
     except KeyError as exc:
         raise InvalidRequest(f"Unsupported asset type: {value!r}") from exc
+
+
+def normalize_market(value: Market | str | None) -> Market | None:
+    return _normalize_market(value)
 
 
 def _normalize_market(value: Market | str | None) -> Market | None:

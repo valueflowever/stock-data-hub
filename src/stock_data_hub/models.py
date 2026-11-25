@@ -26,6 +26,7 @@ class Capability(str, Enum):
     RESTRICTED_RELEASES = "restricted_releases"
     DISCLOSURES = "disclosures"
     US_DAILY_CLOSES = "us_daily_closes"
+    ADJUST_FACTORS = "adjust_factors"
 
 
 class Market(str, Enum):
@@ -56,6 +57,13 @@ class Adjust(str, Enum):
     QFQ = "qfq"
     HFQ = "hfq"
     NONE = "none"
+
+
+class AdjustMethod(str, Enum):
+    RAW = "raw"
+    PROPORTIONAL = "proportional"
+    ARITHMETIC = "arithmetic"
+    UNKNOWN = "unknown"
 
 
 class QuoteFreshness(str, Enum):
@@ -110,6 +118,18 @@ class Instrument:
     name: str
     market: Market = Market.CN
     asset_type: AssetType = AssetType.STOCK
+    status: str = "active"
+    list_date: date | None = None
+    delist_date: date | None = None
+
+
+@dataclass(frozen=True)
+class AdjustFactor:
+    symbol: str
+    ex_date: date
+    qfq_factor: Decimal | None = None
+    hfq_factor: Decimal | None = None
+    market: Market = Market.CN
 
 
 @dataclass(frozen=True)
@@ -161,6 +181,7 @@ class Disclosure:
     symbol: str
     announce_date: date
     title: str
+    published_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -188,6 +209,8 @@ class BarDataQuality:
     truncated: bool = False
     volume_unit: str = "shares"
     currency: str = "CNY"
+    suspended_rows: int = 0
+    adjust_method: str = "raw"
 
 
 @dataclass(frozen=True)

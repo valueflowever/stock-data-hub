@@ -10,11 +10,20 @@ from datetime import datetime, timedelta, timezone
 from math import isfinite
 from threading import RLock
 from time import monotonic
-from typing import Generic, TypeVar
+from typing import Any, Generic, Protocol, TypeVar
 
 from stock_data_hub._workers import remaining_timeout
 
 T = TypeVar("T")
+
+
+class ResultCache(Protocol):
+    """Minimal contract accepted by ``DataHub(cache=...)``."""
+
+    def get_fresh(self, key: str) -> object | None: ...
+    def get_stale(self, key: str) -> object | None: ...
+    def set(self, key: str, value: object, ttl: timedelta, stale_ttl: timedelta) -> None: ...
+    def clear(self) -> None: ...
 
 
 @dataclass(frozen=True)
@@ -32,7 +41,7 @@ class InMemoryResultCache:
     business code, because caching sits behind the hub boundary.
     """
 
-    def __init__(self, max_entries: int = 512) -> None:
+    def __init__(self, max_entries: int = 2048) -> None:
         if max_entries < 1:
             raise ValueError("max_entries must be at least one")
         self.max_entries = max_entries
@@ -96,11 +105,24 @@ class SharedFetchCache:
     share one result, and failed refreshes never promote old data to fresh.
     """
 
-    def __init__(self, ttl_seconds: float = 3, max_entries: int = 16) -> None:
-        if not isfinite(ttl_seconds) or ttl_seconds < 0 or max_entries < 1:
+    def __init__(
+        self,
+        ttl_seconds: float = 3,
+        max_entries: int = 16,
+        *,
+        wait_timeout_seconds: float = 60.0,
+    ) -> None:
+        if (
+            not isfinite(ttl_seconds)
+            or ttl_seconds < 0
+            or max_entries < 1
+            or not isfinite(wait_timeout_seconds)
+            or wait_timeout_seconds <= 0
+        ):
             raise ValueError("Invalid shared-fetch cache limits")
         self.ttl_seconds = ttl_seconds
         self.max_entries = max_entries
+        self.wait_timeout_seconds = wait_timeout_seconds
         self._values: OrderedDict[str, tuple[float, CachedFetch]] = OrderedDict()
         self._inflight: dict[str, Future] = {}
         self._fetch_lock = RLock()
@@ -118,14 +140,13 @@ class SharedFetchCache:
                 self._inflight[key] = pending
         assert pending is not None
         if not owner:
-            return replace(pending.result(timeout=remaining_timeout(20.0)), cache_hit=True)
+            return replace(
+                pending.result(timeout=remaining_timeout(self.wait_timeout_seconds)),
+                cache_hit=True,
+            )
         try:
             result = CachedFetch(loader(), _utc_now())
-            with self._fetch_lock:
-                self._values[key] = (monotonic() + self.ttl_seconds, result)
-                self._values.move_to_end(key)
-                while len(self._values) > self.max_entries:
-                    self._values.popitem(last=False)
+            self._store(key, result)
             pending.set_result(result)
             return result
         except BaseException as exc:
@@ -134,6 +155,26 @@ class SharedFetchCache:
         finally:
             with self._fetch_lock:
                 self._inflight.pop(key, None)
+
+    def peek(self, key: str) -> CachedFetch[Any] | None:
+        with self._fetch_lock:
+            cached = self._values.get(key)
+            if cached is not None and cached[0] > monotonic():
+                self._values.move_to_end(key)
+                return replace(cached[1], cache_hit=True)
+            return None
+
+    def put(self, key: str, value: T, fetched_at: datetime | None = None) -> CachedFetch[T]:
+        result = CachedFetch(value, fetched_at or _utc_now())
+        self._store(key, result)
+        return result
+
+    def _store(self, key: str, result: CachedFetch[Any]) -> None:
+        with self._fetch_lock:
+            self._values[key] = (monotonic() + self.ttl_seconds, result)
+            self._values.move_to_end(key)
+            while len(self._values) > self.max_entries:
+                self._values.popitem(last=False)
 
     def clear(self) -> None:
         with self._fetch_lock:
