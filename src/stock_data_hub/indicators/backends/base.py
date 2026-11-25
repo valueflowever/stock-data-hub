@@ -22,6 +22,10 @@ class IndicatorBackend(ABC):
     def lookback(self, indicator_id: str, params: Mapping[str, ParameterValue]) -> int:
         """Return the exact number of leading observations without an output."""
 
+    def warmup(self, indicator_id: str, params: Mapping[str, ParameterValue]) -> int:
+        """Return prior observations needed for recursive indicators to converge."""
+        return self.lookback(indicator_id, params)
+
     @abstractmethod
     def compute(
         self,

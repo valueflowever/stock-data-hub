@@ -59,6 +59,11 @@ class IndicatorRegistry:
             entries.append(
                 replace(
                     definition,
+                    default_warmup=(
+                        definition.default_warmup
+                        if definition.default_warmup is not None
+                        else definition.default_lookback
+                    ),
                     available=available,
                     unavailable_reason=(
                         None
@@ -112,6 +117,7 @@ class IndicatorRegistry:
             lookback = backend.lookback(definition.id, params)
             if lookback < 0:
                 raise InvalidIndicatorRequest(f"{definition.id} returned a negative lookback")
+            warmup = max(lookback, backend.warmup(definition.id, params))
 
             output_columns = {
                 output.name: alias if len(definition.outputs) == 1 else f"{alias}.{output.name}"
@@ -132,6 +138,7 @@ class IndicatorRegistry:
                 lookback=lookback,
                 backend=backend.name,
                 backend_version=backend.version,
+                warmup=warmup,
             )
             resolved.append(ResolvedIndicator(definition, backend, execution))
         return tuple(resolved)

@@ -51,6 +51,18 @@ class TaLibBackend(IndicatorBackend):
                 f"TA-Lib could not determine lookback for {indicator_id}"
             ) from exc
 
+    def warmup(self, indicator_id: str, params: Mapping[str, ParameterValue]) -> int:
+        base = self.lookback(indicator_id, params)
+        if indicator_id == "overlap.ema":
+            return max(base * 10, 150)
+        if indicator_id in {"momentum.rsi", "volatility.atr"}:
+            return max(base * 14, 200)
+        if indicator_id == "trend.macd":
+            return max(base * 8, 250)
+        if indicator_id == "trend.adx":
+            return max(base * 10, 270)
+        return base
+
     def compute(
         self,
         indicator_id: str,

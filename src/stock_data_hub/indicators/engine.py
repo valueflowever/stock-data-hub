@@ -13,7 +13,7 @@ import numpy as np
 
 from stock_data_hub._workers import BoundedWorkers, WorkerBusy
 from stock_data_hub.errors import IndicatorCalculationError, InvalidIndicatorRequest, ResourceBusy
-from stock_data_hub.hub import DataHub
+from stock_data_hub.hub import DataHub, normalize_bar_window
 from stock_data_hub.indicators.catalog import CATALOG_VERSION
 from stock_data_hub.indicators.contracts import (
     FactorColumn,
@@ -36,7 +36,6 @@ from stock_data_hub.normalization import (
     asset_type_from_symbol,
     market_from_symbol,
     normalize_symbol,
-    to_beijing,
 )
 
 _INPUT_COLUMNS = ("open", "high", "low", "close", "volume", "amount")
@@ -109,13 +108,21 @@ class IndicatorEngine:
         normalized_asset_type = asset_type_from_symbol(normalized_symbol, asset_type)
         normalized_interval = Interval(interval)
         normalized_adjust = Adjust(adjust)
-        start_bj = to_beijing(start)
-        end_bj = to_beijing(end)
-        if start_bj > end_bj:
-            raise InvalidIndicatorRequest("start must be before end")
+        try:
+            start_bj, end_bj = normalize_bar_window(start, end, normalized_interval)
+        except ValueError as exc:
+            raise InvalidIndicatorRequest(str(exc)) from exc
 
         resolved = self.registry.resolve(indicators)
-        required_warmup = max(item.execution.lookback for item in resolved)
+        required_lookback = max(item.execution.lookback for item in resolved)
+        required_target = max(
+            (
+                item.execution.warmup
+                if item.execution.warmup is not None
+                else item.execution.lookback
+            )
+            for item in resolved
+        )
         bars_result, eligible_bars, excluded_open = await self._load_bars_with_warmup(
             normalized_symbol,
             normalized_interval,
@@ -124,7 +131,7 @@ class IndicatorEngine:
             normalized_adjust,
             normalized_market,
             normalized_asset_type,
-            required_warmup,
+            required_target,
             closed_only,
             allow_peers,
         )
@@ -139,14 +146,15 @@ class IndicatorEngine:
             raise InvalidIndicatorRequest(
                 f"Indicator output exceeds the {self.max_output_cells}-cell limit"
             )
-        loaded_warmup = min(len(pre_bars), required_warmup)
-        if loaded_warmup < required_warmup and on_insufficient == "error":
+        loaded_lookback = min(len(pre_bars), required_lookback)
+        loaded_warmup = min(len(pre_bars), required_target)
+        if loaded_lookback < required_lookback and on_insufficient == "error":
             raise InvalidIndicatorRequest(
-                f"Insufficient history: required {required_warmup} warm-up bars, "
-                f"loaded {loaded_warmup}"
+                f"Insufficient history: required {required_lookback} warm-up bars, "
+                f"loaded {loaded_lookback}"
             )
 
-        retained_pre = pre_bars[-required_warmup:] if required_warmup else []
+        retained_pre = pre_bars[-required_target:] if required_target else []
         fingerprint_bars = [*retained_pre, *output_bars]
         if len(fingerprint_bars) > self.max_input_rows:
             raise InvalidIndicatorRequest(
@@ -155,7 +163,7 @@ class IndicatorEngine:
 
         compute_started_at = perf_counter()
         try:
-            factor_columns, factor_values = await self._calculation_workers.run(
+            factor_columns, factor_values, compute_warnings = await self._calculation_workers.run(
                 lambda: _compute_factor_values(resolved, pre_bars, output_bars, include_inputs),
                 queue_timeout=5.0,
             )
@@ -184,11 +192,17 @@ class IndicatorEngine:
         )
 
         warnings = list(bars_result.metadata.warnings)
-        if loaded_warmup < required_warmup:
+        if loaded_lookback < required_lookback:
             warnings.append(
-                f"Insufficient history: required {required_warmup} warm-up bars, "
-                f"loaded {loaded_warmup}; leading values are null."
+                f"Insufficient history: required {required_lookback} warm-up bars, "
+                f"loaded {loaded_lookback}; leading values are null."
             )
+        elif loaded_warmup < required_target:
+            warnings.append(
+                f"Partial convergence warm-up: loaded {loaded_warmup} of {required_target} "
+                "recommended warm-up bars; recursive indicator values may have residual seed bias."
+            )
+        warnings.extend(compute_warnings)
         if excluded_open:
             warnings.append(f"Excluded {excluded_open} unclosed bar(s) from indicator inputs.")
         if not closed_only and any(not bar.is_closed for bar in output_bars):
@@ -205,7 +219,7 @@ class IndicatorEngine:
             computed_at=datetime.now(tz=BEIJING_TZ),
             latency_ms=compute_latency_ms,
             calculation_start=calculation_start,
-            warmup_rows_required=required_warmup,
+            warmup_rows_required=required_lookback,
             warmup_rows_loaded=loaded_warmup,
             input_rows=len(fingerprint_bars),
             output_rows=len(output_bars),
@@ -220,6 +234,7 @@ class IndicatorEngine:
                 bars_result.metadata.fetched_at if normalized_adjust is not Adjust.NONE else None
             ),
             executions=tuple(item.execution for item in resolved),
+            warmup_rows_target=required_target,
         )
         total_latency_ms = (perf_counter() - started_at) * 1000
         metadata = IndicatorMetadata.from_bars(
@@ -287,9 +302,10 @@ def _compute_factor_values(
     pre_bars: Sequence[AShareBar],
     output_bars: Sequence[AShareBar],
     include_inputs: bool,
-) -> tuple[tuple[FactorColumn, ...], Mapping[str, list[Decimal | None]]]:
+) -> tuple[tuple[FactorColumn, ...], Mapping[str, list[Decimal | None]], tuple[str, ...]]:
     columns: list[FactorColumn] = []
     values: dict[str, list[Decimal | None]] = {}
+    warnings: list[str] = []
     if include_inputs:
         valid_from = output_bars[0].ts if output_bars else None
         for name in _INPUT_COLUMNS:
@@ -300,9 +316,13 @@ def _compute_factor_values(
 
     for item in resolved:
         execution = item.execution
-        spec_pre = list(pre_bars[-execution.lookback :]) if execution.lookback else []
+        effective_warmup = (
+            execution.warmup if execution.warmup is not None else execution.lookback
+        )
+        spec_pre = list(pre_bars[-effective_warmup:]) if effective_warmup else []
         calculation_bars = [*spec_pre, *output_bars]
         output_values: Mapping[str, np.ndarray]
+        inputs: dict[str, np.ndarray] = {}
         if output_bars:
             inputs = _input_arrays(
                 calculation_bars, item.definition.required_inputs, item.definition.id
@@ -324,11 +344,29 @@ def _compute_factor_values(
             )
         offset = len(spec_pre)
         for output in item.definition.outputs:
-            raw = np.asarray(output_values[output.name])
+            raw = np.asarray(output_values[output.name], dtype=np.float64).copy()
             if len(raw) != len(calculation_bars):
                 raise IndicatorCalculationError(
                     f"{item.backend.name} returned a misaligned {output.name} output"
                 )
+            if (
+                item.definition.id == "momentum.roc"
+                and output_bars
+                and "close" in inputs
+                and np.any(inputs["close"] <= 0.0)
+            ):
+                period = int(execution.params["period"])
+                closes = inputs["close"]
+                masked_any = False
+                for idx in range(offset, len(raw)):
+                    if closes[idx] <= 0.0 or (idx >= period and closes[idx - period] <= 0.0):
+                        raw[idx] = np.nan
+                        masked_any = True
+                if masked_any:
+                    warnings.append(
+                        "Excluded non-positive adjusted price(s) from ratio-based indicator "
+                        "outputs (momentum.roc); prefer proportional adjustment or Adjust.NONE."
+                    )
             converted = [_finite_decimal(value) for value in raw[offset:]]
             column_name = execution.outputs[output.name]
             valid_from = next(
@@ -352,7 +390,7 @@ def _compute_factor_values(
                     valid_from=valid_from,
                 )
             )
-    return tuple(columns), values
+    return tuple(columns), values, tuple(warnings)
 
 
 def _input_arrays(

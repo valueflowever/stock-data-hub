@@ -65,6 +65,7 @@ INDICATOR_DEFINITIONS = (
         backend="ta-lib",
         variant="talib",
         overlay=True,
+        default_warmup=190,
     ),
     IndicatorDefinition(
         id="momentum.rsi",
@@ -78,6 +79,7 @@ INDICATOR_DEFINITIONS = (
         default_lookback=14,
         backend="ta-lib",
         variant="wilder",
+        default_warmup=200,
     ),
     IndicatorDefinition(
         id="trend.macd",
@@ -99,6 +101,7 @@ INDICATOR_DEFINITIONS = (
         default_lookback=33,
         backend="ta-lib",
         variant="talib",
+        default_warmup=264,
     ),
     IndicatorDefinition(
         id="volatility.bbands",
@@ -140,6 +143,7 @@ INDICATOR_DEFINITIONS = (
         default_lookback=14,
         backend="ta-lib",
         variant="wilder",
+        default_warmup=200,
     ),
     IndicatorDefinition(
         id="momentum.stoch",
@@ -177,6 +181,7 @@ INDICATOR_DEFINITIONS = (
         default_lookback=27,
         backend="ta-lib",
         variant="wilder",
+        default_warmup=270,
     ),
     IndicatorDefinition(
         id="momentum.roc",

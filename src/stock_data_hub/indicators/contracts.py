@@ -63,6 +63,7 @@ class IndicatorDefinition:
     status: str = "stable"
     available: bool = False
     unavailable_reason: str | None = None
+    default_warmup: int | None = None
 
 
 @dataclass(frozen=True)
@@ -83,6 +84,7 @@ class IndicatorExecution:
     lookback: int
     backend: str
     backend_version: str
+    warmup: int | None = None
 
 
 @dataclass(frozen=True)
@@ -156,6 +158,7 @@ class IndicatorRunMetadata:
     adjustment_as_of: datetime | None
     executions: tuple[IndicatorExecution, ...]
     cache_hit: bool = False
+    warmup_rows_target: int | None = None
 
 
 @dataclass(frozen=True)
