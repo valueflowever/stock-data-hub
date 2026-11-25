@@ -25,6 +25,7 @@ from stock_data_hub.errors import (
 from stock_data_hub.hub import DataHub
 from stock_data_hub.models import (
     Adjust,
+    AdjustFactor,
     AShareBar,
     AssetType,
     CompanyProfile,
@@ -52,6 +53,9 @@ def create_app(
     *,
     api_key: str | None = None,
     indicator_engine: IndicatorEngine | None = None,
+    max_intraday_days: int = 366,
+    max_hourly_days: int = 730,
+    max_disclosure_days: int = 1825,
 ) -> Any:
     """Create a small FastAPI application around a hub instance.
 
@@ -177,6 +181,11 @@ def create_app(
         asset_type: AssetType | None = None,
         data_hub_hop: int = Header(default=0, alias="X-Data-Hub-Hop", ge=0),
     ) -> dict[str, Any]:
+        span_days = (end - start).total_seconds() / 86400.0
+        if interval is Interval.MINUTE_15 and span_days > max_intraday_days:
+            raise ValueError(f"15m bar window cannot exceed {max_intraday_days} days per request")
+        if interval is Interval.HOUR_1 and span_days > max_hourly_days:
+            raise ValueError(f"1h bar window cannot exceed {max_hourly_days} days per request")
         return _result_body(
             await data_hub.get_bars(
                 symbol,
@@ -199,11 +208,14 @@ def create_app(
     ) -> dict[str, Any]:
         result = await data_hub.get_snapshot(allow_peers=data_hub_hop == 0)
         rows, total = _page(result.value.rows, search, offset, limit)
-        data = to_jsonable(result.value)
-        data["rows"] = to_jsonable(rows)
-        data["total_rows"] = total
-        data["offset"] = offset
-        data["limit"] = limit
+        data = {
+            "rows": to_jsonable(rows),
+            "has_market_cap": result.value.has_market_cap,
+            "fetched_at": result.value.fetched_at.isoformat(),
+            "total_rows": total,
+            "offset": offset,
+            "limit": limit,
+        }
         return _result_body(result, data=data)
 
     @app.get("/instruments", tags=["reference"], response_model=DataResponse[InstrumentPage])
@@ -237,9 +249,13 @@ def create_app(
             for trade_date in result.value.trade_dates
             if (start is None or trade_date >= start) and (end is None or trade_date <= end)
         )
-        data = to_jsonable(result.value)
-        data["trade_dates"] = to_jsonable(dates)
-        data["count"] = len(dates)
+        data = {
+            "trade_dates": to_jsonable(dates),
+            "start_date": result.value.start_date.isoformat(),
+            "end_date": result.value.end_date.isoformat(),
+            "fetched_at": result.value.fetched_at.isoformat(),
+            "count": len(dates),
+        }
         return _result_body(result, data=data)
 
     @app.get(
@@ -275,6 +291,10 @@ def create_app(
         end: date,
         data_hub_hop: int = Header(default=0, alias="X-Data-Hub-Hop", ge=0),
     ) -> dict[str, Any]:
+        if start > end:
+            raise ValueError("start must be before end")
+        if (end - start).days > max_disclosure_days:
+            raise ValueError(f"Disclosure window cannot exceed {max_disclosure_days} days per request")
         return _result_body(
             await data_hub.get_disclosures(
                 symbol,
@@ -285,17 +305,41 @@ def create_app(
         )
 
     @app.get(
+        "/adjust-factors/{symbol}",
+        tags=["market"],
+        response_model=DataResponse[list[AdjustFactor]],
+    )
+    async def adjust_factors(
+        symbol: str,
+        start: date | None = None,
+        end: date | None = None,
+        market: Market | None = None,
+        data_hub_hop: int = Header(default=0, alias="X-Data-Hub-Hop", ge=0),
+    ) -> dict[str, Any]:
+        return _result_body(
+            await data_hub.get_adjust_factors(
+                symbol,
+                start,
+                end,
+                market,
+                allow_peers=data_hub_hop == 0,
+            )
+        )
+
+    @app.get(
         "/us-daily-closes/{ticker}", tags=["market"], response_model=DataResponse[list[DailyClose]]
     )
     async def us_daily_closes(
         ticker: str,
         max_rows: int = Query(default=80, ge=1, le=5000),
+        adjust: Adjust = Adjust.NONE,
         data_hub_hop: int = Header(default=0, alias="X-Data-Hub-Hop", ge=0),
     ) -> dict[str, Any]:
         return _result_body(
             await data_hub.get_us_daily_closes(
                 ticker,
                 max_rows,
+                adjust=adjust,
                 allow_peers=data_hub_hop == 0,
             )
         )
