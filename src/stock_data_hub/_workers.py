@@ -7,7 +7,7 @@ import math
 import sys
 from collections.abc import Callable, Iterator
 from concurrent.futures import Future
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager
 from contextvars import ContextVar, copy_context
 from math import isfinite
 from queue import Empty, SimpleQueue
@@ -123,6 +123,11 @@ class RateLimiter:
             self._tokens -= 1.0
             return wait_seconds
 
+    def refund(self) -> None:
+        """Return one unconsumed token when a sleeping waiter is cancelled before execution."""
+        with self._lock:
+            self._tokens = min(self.burst, self._tokens + 1.0)
+
 
 class BoundedWorkers:
     def __init__(
@@ -181,17 +186,16 @@ class BoundedWorkers:
 
     def _submit_work(self, job: Callable[[], None]) -> None:
         with self._lock:
-            self._work_queue.put(job)
-            needed = self._busy_threads + self._work_queue.qsize()
+            needed = self._busy_threads + self._work_queue.qsize() + 1
             if self._live_threads < needed:
-                self._live_threads += 1
                 try:
                     Thread(target=self._worker_loop, name=self.name, daemon=True).start()
                 except BaseException:
-                    self._live_threads -= 1
-                    with suppress(Empty):
-                        self._work_queue.get_nowait()
-                    raise
+                    if self._live_threads == 0:
+                        raise
+                else:
+                    self._live_threads += 1
+            self._work_queue.put(job)
 
     async def run(
         self,
@@ -208,8 +212,20 @@ class BoundedWorkers:
         if not self._admission.acquire(blocking=False):
             raise WorkerBusy(f"{self.name} request queue is full")
         slot_acquired = False
-        submitted = False
+        slot_handed_off = False
         try:
+            if self._rate_limiter is not None:
+                max_rate_wait = max(deadline - monotonic(), 0.0) if deadline is not None else None
+                wait_seconds = self._rate_limiter.reserve(max_wait=max_rate_wait)
+                if wait_seconds is None:
+                    raise WorkerBusy(f"{self.name} rate limit budget exhausted")
+                if wait_seconds > 0:
+                    try:
+                        await asyncio.sleep(wait_seconds)
+                    except asyncio.CancelledError:
+                        self._rate_limiter.refund()
+                        raise
+
             queue_deadline = monotonic() + queue_timeout
             if deadline is not None:
                 queue_deadline = min(queue_deadline, deadline)
@@ -218,14 +234,6 @@ class BoundedWorkers:
                     raise WorkerBusy(f"{self.name} has no available worker slot")
                 await asyncio.sleep(min(0.01, max(queue_deadline - monotonic(), 0)))
             slot_acquired = True
-
-            if self._rate_limiter is not None:
-                max_rate_wait = max(deadline - monotonic(), 0.0) if deadline is not None else None
-                wait_seconds = self._rate_limiter.reserve(max_wait=max_rate_wait)
-                if wait_seconds is None:
-                    raise WorkerBusy(f"{self.name} rate limit budget exhausted")
-                if wait_seconds > 0:
-                    await asyncio.sleep(wait_seconds)
 
             native: Future[T] = Future()
             context = copy_context()
@@ -239,6 +247,7 @@ class BoundedWorkers:
                 self._slots.release()
 
             native.add_done_callback(finished)
+            slot_handed_off = True
 
             def invoke() -> T:
                 _CANCELLED.set(cancelled)
@@ -258,7 +267,6 @@ class BoundedWorkers:
             try:
                 # Threads are bounded, reused across calls, and never share asyncio's default executor.
                 self._submit_work(work)
-                submitted = True
             except BaseException:
                 native.cancel()
                 raise
@@ -274,7 +282,7 @@ class BoundedWorkers:
                 native.cancel()
                 raise
         finally:
-            if slot_acquired and not submitted:
+            if slot_acquired and not slot_handed_off:
                 self._slots.release()
             self._admission.release()
 

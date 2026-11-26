@@ -13,6 +13,7 @@ from time import monotonic
 from typing import Any, Generic, Protocol, TypeVar
 
 from stock_data_hub._workers import remaining_timeout
+from stock_data_hub.normalization import BEIJING_TZ
 
 T = TypeVar("T")
 
@@ -145,7 +146,7 @@ class SharedFetchCache:
                 cache_hit=True,
             )
         try:
-            result = CachedFetch(loader(), _utc_now())
+            result = CachedFetch(loader(), datetime.now(tz=BEIJING_TZ))
             self._store(key, result)
             pending.set_result(result)
             return result
@@ -165,7 +166,7 @@ class SharedFetchCache:
             return None
 
     def put(self, key: str, value: T, fetched_at: datetime | None = None) -> CachedFetch[T]:
-        result = CachedFetch(value, fetched_at or _utc_now())
+        result = CachedFetch(value, fetched_at or datetime.now(tz=BEIJING_TZ))
         self._store(key, result)
         return result
 

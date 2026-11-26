@@ -7,6 +7,7 @@ import logging
 import sqlite3
 import zlib
 from collections.abc import Mapping
+from contextlib import suppress
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -86,6 +87,7 @@ class SQLiteResultCache:
             self.path.parent.mkdir(parents=True, exist_ok=True)
         self.max_entries = max_entries
         self._touch_interval_seconds = touch_interval_seconds
+        self._writes_since_evict = 0
         self._lock = RLock()
         self._conn = sqlite3.connect(
             ":memory:" if str(path) == ":memory:" else str(self.path),
@@ -93,10 +95,10 @@ class SQLiteResultCache:
             check_same_thread=False,
         )
         with self._lock:
+            self._conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
             if str(path) != ":memory:":
                 self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA synchronous=NORMAL")
-            self._conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
             self._conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS cache_entries (
@@ -121,6 +123,11 @@ class SQLiteResultCache:
                 ON cache_entries (stale_until)
                 """
             )
+            with suppress(sqlite3.Error):
+                self._conn.execute(
+                    "DELETE FROM cache_entries WHERE schema_version != ?",
+                    (_SCHEMA_VERSION,),
+                )
             self._conn.commit()
 
     def get_fresh(self, key: str) -> object | None:
@@ -253,20 +260,33 @@ class SQLiteResultCache:
                     self._conn.commit()
                     return None
                 if now - float(last_accessed) >= self._touch_interval_seconds:
-                    self._conn.execute(
-                        "UPDATE cache_entries SET last_accessed = ? WHERE cache_key = ?",
-                        (now, key),
-                    )
-                    self._conn.commit()
+                    try:
+                        self._conn.execute(
+                            "UPDATE cache_entries SET last_accessed = ? WHERE cache_key = ?",
+                            (now, key),
+                        )
+                        self._conn.commit()
+                    except sqlite3.Error as touch_exc:
+                        with suppress(sqlite3.Error):
+                            self._conn.rollback()
+                        logger.debug(
+                            "SQLiteResultCache touch skipped under lock contention on %s: %s",
+                            self.path,
+                            touch_exc,
+                        )
                 return decoded
         except sqlite3.Error as exc:
             logger.warning("SQLiteResultCache read degraded on %s: %s", self.path, exc)
             return None
 
     def _evict_locked(self, now: float) -> None:
+        self._writes_since_evict += 1
+        if self.max_entries > 64 and self._writes_since_evict < 32:
+            return
+        self._writes_since_evict = 0
         self._conn.execute(
-            "DELETE FROM cache_entries WHERE stale_until <= ? OR schema_version != ?",
-            (now, _SCHEMA_VERSION),
+            "DELETE FROM cache_entries WHERE stale_until <= ?",
+            (now,),
         )
         count = int(self._conn.execute("SELECT COUNT(*) FROM cache_entries").fetchone()[0])
         overflow = count - self.max_entries
@@ -373,6 +393,8 @@ def _encode_payload_value(value: object) -> dict[str, Any]:
                         "ex_date": item.ex_date.isoformat(),
                         "qfq_factor": _opt_dec_str(item.qfq_factor),
                         "hfq_factor": _opt_dec_str(item.hfq_factor),
+                        "qfq_offset": _opt_dec_str(item.qfq_offset),
+                        "hfq_offset": _opt_dec_str(item.hfq_offset),
                         "market": item.market.value,
                     }
                     for item in value
@@ -458,6 +480,8 @@ def _decode_payload_value(raw: Mapping[str, Any]) -> Any:
                 ex_date=date.fromisoformat(item["ex_date"]),
                 qfq_factor=_opt_dec(item["qfq_factor"]),
                 hfq_factor=_opt_dec(item["hfq_factor"]),
+                qfq_offset=_opt_dec(item.get("qfq_offset")),
+                hfq_offset=_opt_dec(item.get("hfq_offset")),
                 market=Market(item["market"]),
             )
             for item in data
@@ -467,7 +491,7 @@ def _decode_payload_value(raw: Mapping[str, Any]) -> Any:
             trade_dates=frozenset(date.fromisoformat(d) for d in data["trade_dates"]),
             start_date=date.fromisoformat(data["start_date"]),
             end_date=date.fromisoformat(data["end_date"]),
-            fetched_at=datetime.fromisoformat(data["fetched_at"]),
+            fetched_at=_from_iso(data["fetched_at"]),
         )
     if kind == "CompanyProfile":
         return CompanyProfile(
@@ -495,7 +519,7 @@ def _decode_payload_value(raw: Mapping[str, Any]) -> Any:
                 announce_date=date.fromisoformat(item["announce_date"]),
                 title=item["title"],
                 published_at=(
-                    datetime.fromisoformat(item["published_at"])
+                    _from_iso(item["published_at"])
                     if item.get("published_at")
                     else None
                 ),
@@ -532,7 +556,7 @@ def _encode_bar(bar: AShareBar) -> list[Any]:
 def _decode_bar(item: list[Any]) -> AShareBar:
     return AShareBar(
         symbol=item[0],
-        ts=datetime.fromisoformat(item[1]),
+        ts=_from_iso(item[1]),
         open=Decimal(item[2]),
         high=Decimal(item[3]),
         low=Decimal(item[4]),
@@ -558,7 +582,7 @@ def _decode_quote(data: Mapping[str, Any]) -> Quote:
     return Quote(
         symbol=data["symbol"],
         price=Decimal(data["price"]),
-        ts=datetime.fromisoformat(data["ts"]),
+        ts=_from_iso(data["ts"]),
         market=Market(data["market"]),
         freshness=QuoteFreshness(data["freshness"]),
     )
@@ -598,7 +622,7 @@ def _decode_snapshot(data: Mapping[str, Any]) -> Snapshot:
             for row in data["rows"]
         ),
         has_market_cap=bool(data["has_market_cap"]),
-        fetched_at=datetime.fromisoformat(data["fetched_at"]),
+        fetched_at=_from_iso(data["fetched_at"]),
     )
 
 
@@ -649,15 +673,15 @@ def _decode_metadata(data: Mapping[str, Any]) -> FetchMetadata:
     quality = None
     if isinstance(raw_quality, Mapping):
         quality = BarDataQuality(
-            requested_start=datetime.fromisoformat(raw_quality["requested_start"]),
-            requested_end=datetime.fromisoformat(raw_quality["requested_end"]),
+            requested_start=_from_iso(raw_quality["requested_start"]),
+            requested_end=_from_iso(raw_quality["requested_end"]),
             available_start=(
-                datetime.fromisoformat(raw_quality["available_start"])
+                _from_iso(raw_quality["available_start"])
                 if raw_quality.get("available_start")
                 else None
             ),
             available_end=(
-                datetime.fromisoformat(raw_quality["available_end"])
+                _from_iso(raw_quality["available_end"])
                 if raw_quality.get("available_end")
                 else None
             ),
@@ -676,7 +700,7 @@ def _decode_metadata(data: Mapping[str, Any]) -> FetchMetadata:
             suspended_rows=int(raw_quality.get("suspended_rows", 0)),
             adjust_method=str(raw_quality.get("adjust_method", "raw")),
         )
-    fetched_at = datetime.fromisoformat(data["fetched_at"])
+    fetched_at = _from_iso(data["fetched_at"])
     if fetched_at.tzinfo is None:
         fetched_at = fetched_at.replace(tzinfo=timezone.utc)
     return FetchMetadata(
@@ -688,12 +712,19 @@ def _decode_metadata(data: Mapping[str, Any]) -> FetchMetadata:
         stale=bool(data["stale"]),
         warnings=tuple(str(item) for item in data["warnings"]),
         received_at=(
-            datetime.fromisoformat(data["received_at"]) if data.get("received_at") else None
+            _from_iso(data["received_at"]) if data.get("received_at") else None
         ),
         age_seconds=float(data["age_seconds"]),
         quality=quality,
         contract_version=str(data.get("contract_version", DATA_CONTRACT_VERSION)),
     )
+
+
+def _from_iso(value: object) -> datetime:
+    text = str(value).strip()
+    if text.endswith(("Z", "z")):
+        text = f"{text[:-1]}+00:00"
+    return datetime.fromisoformat(text)
 
 
 def _opt_dec_str(value: Decimal | None) -> str | None:

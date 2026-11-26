@@ -35,7 +35,7 @@ class _Runtime:
     timeout_count: int = 0
     capacity_rejections: int = 0
     open_trips: int = 0
-    probe_in_flight: bool = False
+    active_probe_id: int | None = None
 
 
 class SourceHealthRegistry:
@@ -53,6 +53,7 @@ class SourceHealthRegistry:
         self.max_cooldown = max(max_cooldown, cooldown)
         self._providers: set[str] = set()
         self._runtimes: dict[tuple[str, str], _Runtime] = {}
+        self._next_probe_id = 0
         self._lock = RLock()
 
     def ensure(self, provider: str) -> None:
@@ -62,48 +63,75 @@ class SourceHealthRegistry:
     def can_attempt(self, provider: str, route: str) -> bool:
         with self._lock:
             runtime = self._runtime(provider, route)
-            if runtime.probe_in_flight:
+            if runtime.active_probe_id is not None:
                 return False
             return runtime.circuit_open_until is None or _utc_now() >= runtime.circuit_open_until
 
-    def try_acquire_attempt(self, provider: str, route: str) -> tuple[bool, bool]:
-        """Return ``(allowed, is_half_open_probe)`` with single-probe gating."""
+    def try_acquire_attempt(self, provider: str, route: str) -> tuple[bool, int | None]:
+        """Return ``(allowed, probe_id)`` with token-bound single-probe gating."""
         with self._lock:
             runtime = self._runtime(provider, route)
             if runtime.circuit_open_until is None:
-                return True, False
+                return True, None
             if _utc_now() < runtime.circuit_open_until:
-                return False, False
-            if runtime.probe_in_flight:
-                return False, False
-            runtime.probe_in_flight = True
-            return True, True
+                return False, None
+            if runtime.active_probe_id is not None:
+                return False, None
+            self._next_probe_id += 1
+            probe_id = self._next_probe_id
+            runtime.active_probe_id = probe_id
+            return True, probe_id
 
-    def finish_probe(self, provider: str, route: str) -> None:
+    def finish_probe(self, provider: str, route: str, probe_id: int | None = None) -> None:
         with self._lock:
             runtime = self._runtime(provider, route)
-            runtime.probe_in_flight = False
+            if probe_id is None or runtime.active_probe_id == probe_id:
+                runtime.active_probe_id = None
+
+    def record_transport_alive(
+        self, provider: str, route: str, *, probe_id: int | None = None
+    ) -> None:
+        """Close a half-open circuit when transport responded cleanly without symbol data."""
+        with self._lock:
+            runtime = self._runtime(provider, route)
+            if probe_id is not None and runtime.active_probe_id == probe_id:
+                runtime.active_probe_id = None
+            if runtime.circuit_open_until is not None and runtime.active_probe_id is None:
+                runtime.consecutive_failures = 0
+                runtime.open_trips = 0
+                runtime.circuit_open_until = None
 
     def record_success(self, provider: str, route: str, latency_ms: float) -> None:
         with self._lock:
             runtime = self._runtime(provider, route)
             runtime.consecutive_failures = 0
             runtime.open_trips = 0
-            runtime.probe_in_flight = False
+            runtime.active_probe_id = None
             runtime.success_count += 1
             runtime.total_latency_ms += latency_ms
             runtime.last_error = None
             runtime.last_success_at = _utc_now()
             runtime.circuit_open_until = None
 
-    def record_failure(self, provider: str, route: str, error: BaseException) -> None:
+    def record_failure(
+        self,
+        provider: str,
+        route: str,
+        error: BaseException,
+        *,
+        probe_id: int | None = None,
+    ) -> None:
         with self._lock:
             runtime = self._runtime(provider, route)
             runtime.consecutive_failures += 1
             runtime.failure_count += 1
             runtime.last_error = _short_error(error)
-            runtime.probe_in_flight = False
-            if runtime.consecutive_failures >= self.failure_threshold:
+            if probe_id is not None and runtime.active_probe_id == probe_id:
+                runtime.active_probe_id = None
+            if (
+                runtime.consecutive_failures >= self.failure_threshold
+                and runtime.active_probe_id is None
+            ):
                 runtime.open_trips += 1
                 backoff_factor = 1 << min(runtime.open_trips - 1, 6)
                 effective_cooldown = min(self.cooldown * backoff_factor, self.max_cooldown)
@@ -113,11 +141,14 @@ class SourceHealthRegistry:
         with self._lock:
             self._runtime(provider, route).timeout_count += 1
 
-    def record_capacity_rejection(self, provider: str, route: str) -> None:
+    def record_capacity_rejection(
+        self, provider: str, route: str, *, probe_id: int | None = None
+    ) -> None:
         with self._lock:
             runtime = self._runtime(provider, route)
             runtime.capacity_rejections += 1
-            runtime.probe_in_flight = False
+            if probe_id is not None and runtime.active_probe_id == probe_id:
+                runtime.active_probe_id = None
 
     def snapshots(self) -> tuple[ProviderHealth, ...]:
         with self._lock:
@@ -132,10 +163,10 @@ class SourceHealthRegistry:
                 if not routes:
                     routes = [(None, _Runtime())]
                 for route, runtime in routes:
-                    if runtime.probe_in_flight:
+                    if runtime.active_probe_id is not None:
                         status = "half_open"
-                    elif runtime.circuit_open_until and now < runtime.circuit_open_until:
-                        status = "open"
+                    elif runtime.circuit_open_until is not None:
+                        status = "open" if now < runtime.circuit_open_until else "half_open"
                     else:
                         status = "closed"
                     average = (
