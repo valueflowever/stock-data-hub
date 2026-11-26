@@ -59,6 +59,10 @@ class HealthResponse(DataEnvelope[list[ProviderHealth]]):
     pass
 
 
+class LivenessResponse(BaseModel):
+    status: str
+
+
 class HubMetrics(BaseModel):
     requests: int
     cache_hits: int

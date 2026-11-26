@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import ipaddress
 import json
 import logging
 import os
@@ -224,7 +225,13 @@ def _environment_bool(name: str) -> bool:
 
 
 def _is_loopback_host(host: str) -> bool:
-    return host.strip().lower() in {"127.0.0.1", "localhost", "::1"}
+    cleaned = host.strip().lower()
+    if cleaned == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(cleaned.strip("[]")).is_loopback
+    except ValueError:
+        return False
 
 
 if __name__ == "__main__":

@@ -8,7 +8,8 @@ from __future__ import annotations
 
 import os
 import secrets
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
+from contextlib import asynccontextmanager
 from datetime import date, datetime
 from typing import TYPE_CHECKING, Any, TypeVar
 
@@ -22,7 +23,7 @@ from stock_data_hub.errors import (
     ProviderError,
     ResourceBusy,
 )
-from stock_data_hub.hub import DataHub
+from stock_data_hub.hub import DataHub, normalize_bar_window
 from stock_data_hub.models import (
     Adjust,
     AdjustFactor,
@@ -39,6 +40,7 @@ from stock_data_hub.models import (
     RestrictedRelease,
     SnapshotRow,
 )
+from stock_data_hub.normalization import market_from_symbol, normalize_symbol
 from stock_data_hub.providers.defaults import create_default_hub
 from stock_data_hub.serialization import to_jsonable
 
@@ -82,10 +84,12 @@ def create_app(
         HealthResponse,
         HubMetrics,
         InstrumentPage,
+        LivenessResponse,
         SnapshotPage,
         ValidationResponse,
     )
 
+    owns_hub = hub is None
     data_hub = hub or create_default_hub()
     if indicator_engine is None:
         from stock_data_hub.indicators.engine import create_default_indicator_engine
@@ -104,11 +108,19 @@ def create_app(
         if provided is None or not secrets.compare_digest(provided, configured_api_key):
             raise HTTPException(status_code=401, detail="Missing or invalid data hub key")
 
+    @asynccontextmanager
+    async def lifespan(_: Any) -> AsyncIterator[None]:
+        try:
+            yield
+        finally:
+            if owns_hub:
+                data_hub.close()
+
     app = FastAPI(
         title="Stock Data Hub",
-        version="0.7.1",
+        version="0.8.0",
         description="Provider-neutral market-data access with source and cache metadata.",
-        dependencies=[Depends(require_api_key)],
+        lifespan=lifespan,
         responses={
             401: {"model": AuthenticationResponse},
             422: {"model": ErrorResponse | ValidationResponse},
@@ -118,6 +130,12 @@ def create_app(
     )
     app.state.data_hub = data_hub
     app.state.api_key_required = configured_api_key is not None
+
+    @app.get("/livez", tags=["service"], response_model=LivenessResponse)
+    async def livez() -> dict[str, str]:
+        return {"status": "ok"}
+
+    app.router.dependencies.append(Depends(require_api_key))
 
     @app.exception_handler(DataHubError)
     async def handle_data_hub_error(_: Any, exc: DataHubError) -> Any:
@@ -181,14 +199,18 @@ def create_app(
         asset_type: AssetType | None = None,
         data_hub_hop: int = Header(default=0, alias="X-Data-Hub-Hop", ge=0),
     ) -> dict[str, Any]:
-        span_days = (end - start).total_seconds() / 86400.0
-        if interval is Interval.MINUTE_15 and span_days > max_intraday_days:
-            raise ValueError(f"15m bar window cannot exceed {max_intraday_days} days per request")
-        if interval is Interval.HOUR_1 and span_days > max_hourly_days:
-            raise ValueError(f"1h bar window cannot exceed {max_hourly_days} days per request")
+        normalized = normalize_symbol(symbol, market)
+        validate_bar_window_span(
+            start,
+            end,
+            interval,
+            market=market_from_symbol(normalized),
+            max_intraday_days=max_intraday_days,
+            max_hourly_days=max_hourly_days,
+        )
         return _result_body(
             await data_hub.get_bars(
-                symbol,
+                normalized,
                 interval,
                 start,
                 end,
@@ -314,6 +336,7 @@ def create_app(
         start: date | None = None,
         end: date | None = None,
         market: Market | None = None,
+        asset_type: AssetType | None = None,
         data_hub_hop: int = Header(default=0, alias="X-Data-Hub-Hop", ge=0),
     ) -> dict[str, Any]:
         return _result_body(
@@ -322,6 +345,7 @@ def create_app(
                 start,
                 end,
                 market,
+                asset_type,
                 allow_peers=data_hub_hop == 0,
             )
         )
@@ -348,9 +372,32 @@ def create_app(
     from stock_data_hub.quote_service import register_quote_routes
 
     app.state.indicator_engine = indicator_engine
-    register_indicator_routes(app, indicator_engine)
+    register_indicator_routes(
+        app,
+        indicator_engine,
+        max_intraday_days=max_intraday_days,
+        max_hourly_days=max_hourly_days,
+    )
     register_quote_routes(app, data_hub)
     return app
+
+
+def validate_bar_window_span(
+    start: datetime,
+    end: datetime,
+    interval: Interval,
+    *,
+    market: Market = Market.CN,
+    max_intraday_days: int = 366,
+    max_hourly_days: int = 730,
+) -> tuple[datetime, datetime]:
+    start_bj, end_bj = normalize_bar_window(start, end, interval, market=market)
+    span_days = (end_bj - start_bj).total_seconds() / 86400.0
+    if interval is Interval.MINUTE_15 and span_days > max_intraday_days:
+        raise ValueError(f"15m bar window cannot exceed {max_intraday_days} days per request")
+    if interval is Interval.HOUR_1 and span_days > max_hourly_days:
+        raise ValueError(f"1h bar window cannot exceed {max_hourly_days} days per request")
+    return start_bj, end_bj
 
 
 def _result_body(result: DataResult[Any], *, data: Any | None = None) -> dict[str, Any]:

@@ -12,7 +12,9 @@ from stock_data_hub.indicators.catalog import CATALOG_VERSION
 from stock_data_hub.indicators.contracts import IndicatorSpec
 from stock_data_hub.indicators.engine import IndicatorEngine
 from stock_data_hub.models import Adjust, AssetType, Interval, Market
+from stock_data_hub.normalization import market_from_symbol, normalize_symbol
 from stock_data_hub.serialization import to_jsonable
+from stock_data_hub.service import validate_bar_window_span
 from stock_data_hub.service_schemas import (
     DataEnvelope,
     IndicatorCatalogPage,
@@ -54,7 +56,13 @@ class IndicatorComputationRequest(BaseModel):
     indicators: list[IndicatorSpecRequest] = Field(min_length=1, max_length=32)
 
 
-def register_indicator_routes(app: Any, engine: IndicatorEngine) -> None:
+def register_indicator_routes(
+    app: Any,
+    engine: IndicatorEngine,
+    *,
+    max_intraday_days: int = 366,
+    max_hourly_days: int = 730,
+) -> None:
     @app.get("/indicators", tags=["indicators"], response_model=DataEnvelope[IndicatorCatalogPage])
     async def indicator_catalog(
         search: str | None = None,
@@ -106,8 +114,17 @@ def register_indicator_routes(app: Any, engine: IndicatorEngine) -> None:
         request: IndicatorComputationRequest,
         data_hub_hop: int = Header(default=0, alias="X-Data-Hub-Hop", ge=0),
     ) -> dict[str, Any]:
+        normalized_symbol = normalize_symbol(request.symbol, request.market)
+        validate_bar_window_span(
+            request.start,
+            request.end,
+            request.interval,
+            market=market_from_symbol(normalized_symbol),
+            max_intraday_days=max_intraday_days,
+            max_hourly_days=max_hourly_days,
+        )
         result = await engine.calculate(
-            request.symbol,
+            normalized_symbol,
             request.interval,
             request.start,
             request.end,
@@ -120,6 +137,16 @@ def register_indicator_routes(app: Any, engine: IndicatorEngine) -> None:
             on_insufficient=request.on_insufficient,
             allow_peers=data_hub_hop == 0,
         )
-        data = to_jsonable(result.value)
-        data["rows"] = to_jsonable(result.value.to_records())
+        frame = result.value
+        data = {
+            "symbol": frame.symbol,
+            "market": frame.market.value,
+            "asset_type": frame.asset_type.value,
+            "interval": frame.interval.value,
+            "adjust": frame.adjust.value,
+            "requested_start": frame.requested_start.isoformat(),
+            "requested_end": frame.requested_end.isoformat(),
+            "columns": to_jsonable(frame.columns),
+            "rows": to_jsonable(frame.to_records()),
+        }
         return {"data": data, "metadata": to_jsonable(result.metadata)}
