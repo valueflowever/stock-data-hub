@@ -13,7 +13,7 @@ from decimal import Decimal
 from enum import Enum
 from typing import Generic, TypeVar
 
-DATA_CONTRACT_VERSION = "2.0"
+DATA_CONTRACT_VERSION = "2.1"
 
 
 class Capability(str, Enum):
@@ -125,11 +125,22 @@ class Instrument:
 
 @dataclass(frozen=True)
 class AdjustFactor:
+    """Canonical affine adjustment parameters for an ex-dividend/split date.
+
+    Adjusted prices follow ``P_adj = P_raw * factor + offset``. Whenever a
+    factor is supplied for ``qfq`` or ``hfq``, its corresponding offset must
+    also be explicitly supplied (``Decimal(0)`` for pure multiplicative series,
+    never ``None``); ``None`` strictly means the upstream does not provide that
+    adjustment direction.
+    """
+
     symbol: str
     ex_date: date
     qfq_factor: Decimal | None = None
     hfq_factor: Decimal | None = None
     market: Market = Market.CN
+    qfq_offset: Decimal | None = None
+    hfq_offset: Decimal | None = None
 
 
 @dataclass(frozen=True)

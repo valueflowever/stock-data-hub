@@ -45,6 +45,52 @@ def period_end(day: date, interval: Interval) -> date:
     return day
 
 
+def _period_first(day: date, interval: Interval) -> date:
+    if interval is Interval.WEEK_1:
+        return day - timedelta(days=day.weekday())
+    if interval is Interval.MONTH_1:
+        return day.replace(day=1)
+    return day
+
+
+def _is_universal_non_session(day: date) -> bool:
+    """Weekends and New Year's Day (Jan 1) are closed on CN, HK, and US exchanges."""
+    return day.weekday() >= 5 or (day.month == 1 and day.day == 1)
+
+
+@lru_cache(maxsize=8192)
+def period_anchor_date(day: date, interval: Interval, market: Market) -> date:
+    """Return the canonical period-end trading date for weekly/monthly bars.
+
+    Anchors weekly and monthly bars to the last actual exchange session in that
+    period (for example Friday, or Thursday when Friday is a holiday). Outside
+    published calendar ranges, falls back to the last non-Jan-1 weekday.
+    """
+    if interval not in {Interval.WEEK_1, Interval.MONTH_1}:
+        return day
+    first = _period_first(day, interval)
+    end = period_end(day, interval)
+    candidate = end
+    fallback_weekday: date | None = None
+    while candidate >= first:
+        try:
+            calendar = _calendar(market, candidate.year)
+        except (ValueError, OverflowError):
+            if not _is_universal_non_session(candidate) and fallback_weekday is None:
+                fallback_weekday = candidate
+            candidate -= timedelta(days=1)
+            continue
+        if candidate.isoformat() in calendar.sessions:
+            return candidate
+        candidate -= timedelta(days=1)
+    if fallback_weekday is not None:
+        return fallback_weekday
+    # Full-week/month holiday fallback: use Friday for weekly or month-end for monthly.
+    if interval is Interval.WEEK_1:
+        return first + timedelta(days=4)
+    return end
+
+
 @lru_cache(maxsize=8192)
 def period_close(day: date, interval: Interval, market: Market) -> datetime | None:
     """Return an actual session close; None means no known session in the period.
@@ -52,14 +98,16 @@ def period_close(day: date, interval: Interval, market: Market) -> datetime | No
     Calendar range errors are left to callers, who must treat them conservatively.
     """
     end = period_end(day, interval)
-    first = day
-    if interval is Interval.WEEK_1:
-        first = day - timedelta(days=day.weekday())
-    elif interval is Interval.MONTH_1:
-        first = day.replace(day=1)
+    first = _period_first(day, interval)
     candidate = end
     while candidate >= first:
-        calendar = _calendar(market, candidate.year)
+        try:
+            calendar = _calendar(market, candidate.year)
+        except (ValueError, OverflowError):
+            if _is_universal_non_session(candidate):
+                candidate -= timedelta(days=1)
+                continue
+            raise
         # A calendar's first/last session may sit inside the year's boundaries.
         if candidate.isoformat() in calendar.sessions:
             close = calendar.session_close(candidate.isoformat()).to_pydatetime()
@@ -71,28 +119,65 @@ def period_close(day: date, interval: Interval, market: Market) -> datetime | No
     return None
 
 
+def _is_beijing_midnight_label(value: datetime) -> bool:
+    return (
+        value.tzinfo is not None
+        and value.utcoffset() == timedelta(hours=8)
+        and value.hour == 0
+        and value.minute == 0
+        and value.second == 0
+        and value.microsecond == 0
+    )
+
+
 def window_has_trading_session(
     start: datetime,
     end: datetime,
     market: Market,
     now: datetime | None = None,
+    interval: Interval = Interval.DAY_1,
 ) -> bool:
     """Return whether ``[start, end]`` contains at least one already-opened session."""
 
     zone = market_timezone(market)
     reference = (now or datetime.now(tz=zone)).astimezone(zone)
+
+    if interval in {Interval.MINUTE_15, Interval.HOUR_1}:
+        local_start = (
+            start.replace(tzinfo=zone) if start.tzinfo is None else start.astimezone(zone)
+        )
+        local_end = end.replace(tzinfo=zone) if end.tzinfo is None else end.astimezone(zone)
+        effective_end = min(local_end, reference)
+        if local_start > effective_end:
+            return False
+        first_day = local_start.date()
+        last_day = effective_end.date()
+        try:
+            scan_start = max(first_day, last_day - timedelta(days=31))
+            candidate = last_day
+            while candidate >= scan_start:
+                calendar = _calendar(market, candidate.year)
+                iso = candidate.isoformat()
+                if iso in calendar.sessions:
+                    sess_open = calendar.session_open(iso).to_pydatetime().astimezone(zone)
+                    sess_close = calendar.session_close(iso).to_pydatetime().astimezone(zone)
+                    if sess_open <= effective_end and sess_close >= local_start:
+                        return True
+                candidate -= timedelta(days=1)
+            return scan_start > first_day
+        except (ValueError, OverflowError):
+            days = min((last_day - first_day).days, 6)
+            return any(
+                (first_day + timedelta(days=offset)).weekday() < 5 for offset in range(days + 1)
+            )
+
     first_day = start.date() if start.tzinfo is None else start.astimezone(zone).date()
     end_day = end.date() if end.tzinfo is None else end.astimezone(zone).date()
-    # Daily date labels are carried as Beijing midnight; when callers pass
-    # Beijing midnight for US/HK dates, keep the label's calendar date rather
-    # than shifting it backward into the previous local evening.
-    if start.tzinfo is not None and start.tzinfo == ZoneInfo("Asia/Shanghai") and (
-        start.hour == 0 and start.minute == 0 and start.second == 0 and start.microsecond == 0
-    ):
+    # Daily+ date labels are carried as Beijing midnight (+08:00); keep the
+    # label's calendar date rather than shifting it into the previous US/HK evening.
+    if _is_beijing_midnight_label(start):
         first_day = start.date()
-    if end.tzinfo is not None and end.tzinfo == ZoneInfo("Asia/Shanghai") and (
-        end.hour == 0 and end.minute == 0 and end.second == 0 and end.microsecond == 0
-    ):
+    if _is_beijing_midnight_label(end):
         end_day = end.date()
 
     last_day = min(end_day, reference.date())

@@ -60,25 +60,45 @@ def normalize_symbol(raw: str, market: Market | str | None = None) -> str:
     if value.endswith(".HK"):
         if requested_market not in (None, Market.HK):
             raise InvalidRequest(f"Symbol market does not match {market!r}: {raw!r}")
-        code = value[:-3]
+        code = value[:-3].removeprefix("HK")
         if not re.fullmatch(r"\d{1,5}", code):
             raise InvalidRequest(f"Invalid Hong Kong symbol: {raw!r}")
         return f"{code.zfill(5)}.HK"
+
+    if re.fullmatch(r"HK\d{1,5}", value):
+        if requested_market not in (None, Market.HK):
+            raise InvalidRequest(f"Symbol market does not match {market!r}: {raw!r}")
+        return f"{value[2:].zfill(5)}.HK"
 
     if value.endswith(".US"):
         if requested_market not in (None, Market.US):
             raise InvalidRequest(f"Symbol market does not match {market!r}: {raw!r}")
         return _normalize_us_symbol(value[:-3])
 
-    if re.fullmatch(r"\d{6}\.(SH|SZ|BJ)", value):
+    cn_prefixed_match = re.fullmatch(
+        r"(?:(?P<prefix>SH|SZ|BJ))?(?P<code>\d{6})(?:\.(?P<suffix>SH|SZ|BJ))?",
+        value,
+    )
+    if cn_prefixed_match is not None and (
+        cn_prefixed_match.group("prefix") is not None
+        or cn_prefixed_match.group("suffix") is not None
+    ):
         if requested_market not in (None, Market.CN):
             raise InvalidRequest(f"Symbol market does not match {market!r}: {raw!r}")
-        code, suffix = value.split(".", maxsplit=1)
+        prefix = cn_prefixed_match.group("prefix")
+        suffix = cn_prefixed_match.group("suffix")
+        code = cn_prefixed_match.group("code")
+        if prefix is not None and suffix is not None and prefix != suffix:
+            raise InvalidRequest(f"Conflicting exchanges in Chinese symbol: {raw!r}")
+        supplied = suffix or prefix
+        assert supplied is not None
         inferred_suffix = _infer_cn_exchange(code)
-        is_sh_index = code.startswith("000") and suffix == "SH"
-        if inferred_suffix is not None and suffix != inferred_suffix and not is_sh_index:
+        is_sh_index = code.startswith("000") and supplied == "SH"
+        if (inferred_suffix is None and not is_sh_index) or (
+            inferred_suffix is not None and supplied != inferred_suffix and not is_sh_index
+        ):
             raise InvalidRequest(f"Exchange does not match Chinese symbol: {raw!r}")
-        return value
+        return f"{code}.{supplied}"
 
     if requested_market == Market.HK:
         if not re.fullmatch(r"\d{1,5}", value):
@@ -86,9 +106,7 @@ def normalize_symbol(raw: str, market: Market | str | None = None) -> str:
         return f"{value.zfill(5)}.HK"
     if requested_market == Market.US:
         return _normalize_us_symbol(value)
-    if requested_market in (None, Market.CN) and re.fullmatch(r"SH000\d{3}", value):
-        return f"{value[2:]}.SH"
-    if requested_market in (None, Market.CN) and re.fullmatch(r"(?:SH|SZ|BJ)?\d{6}", value):
+    if requested_market in (None, Market.CN) and re.fullmatch(r"\d{6}", value):
         return normalize_a_share_symbol(value)
     if requested_market is None:
         return _normalize_us_symbol(value)
@@ -172,9 +190,16 @@ def _normalize_market(value: Market | str | None) -> Market | None:
         raise InvalidRequest(f"Unsupported market: {value!r}") from exc
 
 
+_DISALLOWED_US_SUFFIXES = {"SH", "SZ", "BJ", "HK", "SS", "US"}
+
+
 def _normalize_us_symbol(value: str) -> str:
     ticker = value.strip().upper()
-    if not re.fullmatch(r"[A-Z][A-Z0-9.-]{0,14}", ticker):
+    if re.fullmatch(r"(?:SH|SZ|BJ|HK|SS)\d+", ticker):
+        raise InvalidRequest(f"Invalid US symbol: {value!r}")
+    if not re.fullmatch(r"[A-Z][A-Z0-9-]{0,9}(?:\.[A-Z0-9]{1,2})?", ticker):
+        raise InvalidRequest(f"Invalid US symbol: {value!r}")
+    if "." in ticker and ticker.rsplit(".", maxsplit=1)[-1] in _DISALLOWED_US_SUFFIXES:
         raise InvalidRequest(f"Invalid US symbol: {value!r}")
     return f"{ticker}.US"
 

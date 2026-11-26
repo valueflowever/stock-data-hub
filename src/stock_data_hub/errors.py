@@ -31,6 +31,10 @@ class DataValidationError(ProviderError):
     """A provider returned a response that does not meet the common contract."""
 
 
+class SymbolDataUnavailable(DataValidationError):
+    """Upstream responded cleanly, but has no row or valid price for this symbol."""
+
+
 class InvalidRequest(DataValidationError):
     """The caller supplied a symbol or routing value that cannot be normalized."""
 
