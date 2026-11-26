@@ -313,7 +313,7 @@ def test_dq_3_cross_provider_reconciliation_suspended_filtering_and_adjust_facto
     fake_ak = SimpleNamespace(
         stock_zh_a_hist_em=lambda **_: ef_frame,
         stock_zh_a_hist_sina=lambda **kwargs: (
-            pd.DataFrame({"date": ["2026-07-16"], "qfq_factor": ["0.95"], "hfq_factor": ["12.5"]})
+            pd.DataFrame({"date": ["2026-07-16"], "qfq_factor": ["1.25"], "hfq_factor": ["12.5"]})
             if "factor" in str(kwargs.get("adjust", ""))
             else sina_frame
         ),
@@ -376,7 +376,14 @@ def test_dq_3_cross_provider_reconciliation_suspended_filtering_and_adjust_facto
     )
     hub.close()
     assert factors.value == [
-        AdjustFactor("600519.SH", date(2026, 7, 16), Decimal("0.950000"), Decimal("12.500000"))
+        AdjustFactor(
+            "600519.SH",
+            date(2026, 7, 16),
+            Decimal("0.950000"),
+            Decimal("12.500000"),
+            qfq_offset=Decimal(0),
+            hfq_offset=Decimal(0),
+        )
     ]
     assert cached_factors.metadata.cache_hit
     assert cached_factors.value == factors.value

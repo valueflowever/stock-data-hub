@@ -47,7 +47,7 @@ def _metadata(*, stale: bool = False) -> dict[str, object]:
         "cache_hit": False,
         "stale": stale,
         "warnings": ["peer warning"],
-        "contract_version": "2.0",
+        "contract_version": "2.1",
     }
 
 
@@ -319,8 +319,9 @@ def _remote_bars(body, adjust=Adjust.NONE):
 @pytest.mark.parametrize(
     "section,field,value,match",
     [
-        ("metadata", "contract_version", "1.0", "contract 2.0"),
-        ("metadata", "contract_version", None, "contract 2.0"),
+        ("metadata", "contract_version", "1.0", "contract 2.1"),
+        ("metadata", "contract_version", "2.0", "contract 2.1"),
+        ("metadata", "contract_version", None, "contract 2.1"),
         ("metadata", "fetched_at", None, "fetched_at"),
         ("metadata", "cache_hit", "false", "non-boolean"),
         ("data", "symbol", "000001.SZ", "different symbol"),

@@ -143,7 +143,7 @@ def test_batch_quotes_deduplicate_aliases_and_keep_per_symbol_errors() -> None:
     items = response.json()["data"]
     assert [item["symbol"] for item in items] == ["600519.SH", "600000.SH", "???"]
     assert items[0]["data"]["price"] == "123.45"
-    assert items[0]["metadata"]["contract_version"] == "2.0"
+    assert items[0]["metadata"]["contract_version"] == "2.1"
     assert items[0]["error"] is None
     assert items[1]["data"] is None
     assert items[1]["error"]["type"] == "AllSourcesFailed"
