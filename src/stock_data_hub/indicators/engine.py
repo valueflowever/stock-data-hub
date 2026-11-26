@@ -12,7 +12,12 @@ from time import perf_counter
 import numpy as np
 
 from stock_data_hub._workers import BoundedWorkers, WorkerBusy
-from stock_data_hub.errors import IndicatorCalculationError, InvalidIndicatorRequest, ResourceBusy
+from stock_data_hub.errors import (
+    IndicatorCalculationError,
+    InvalidIndicatorRequest,
+    InvalidRequest,
+    ResourceBusy,
+)
 from stock_data_hub.hub import DataHub, normalize_bar_window
 from stock_data_hub.indicators.catalog import CATALOG_VERSION
 from stock_data_hub.indicators.contracts import (
@@ -52,6 +57,7 @@ class IndicatorEngine:
         max_output_cells: int = 2_000_000,
         max_warmup_expansions: int = 4,
         max_concurrent_calculations: int = 2,
+        calculation_timeout_seconds: float = 30.0,
     ) -> None:
         if max_indicators < 1:
             raise ValueError("max_indicators must be at least one")
@@ -63,12 +69,15 @@ class IndicatorEngine:
             raise ValueError("max_warmup_expansions cannot be negative")
         if max_concurrent_calculations < 1:
             raise ValueError("max_concurrent_calculations must be at least one")
+        if not math.isfinite(calculation_timeout_seconds) or calculation_timeout_seconds <= 0:
+            raise ValueError("calculation_timeout_seconds must be finite and positive")
         self.hub = hub
         self.registry = registry or create_default_registry()
         self.max_indicators = max_indicators
         self.max_input_rows = max_input_rows
         self.max_output_cells = max_output_cells
         self.max_warmup_expansions = max_warmup_expansions
+        self.calculation_timeout_seconds = calculation_timeout_seconds
         self._calculation_workers = BoundedWorkers(
             max_concurrent_calculations, name="data-hub:indicators"
         )
@@ -109,7 +118,9 @@ class IndicatorEngine:
         normalized_interval = Interval(interval)
         normalized_adjust = Adjust(adjust)
         try:
-            start_bj, end_bj = normalize_bar_window(start, end, normalized_interval)
+            start_bj, end_bj = normalize_bar_window(
+                start, end, normalized_interval, market=normalized_market
+            )
         except ValueError as exc:
             raise InvalidIndicatorRequest(str(exc)) from exc
 
@@ -165,6 +176,7 @@ class IndicatorEngine:
         try:
             factor_columns, factor_values, compute_warnings = await self._calculation_workers.run(
                 lambda: _compute_factor_values(resolved, pre_bars, output_bars, include_inputs),
+                timeout=self.calculation_timeout_seconds,
                 queue_timeout=5.0,
             )
         except WorkerBusy as exc:
@@ -259,21 +271,35 @@ class IndicatorEngine:
         allow_peers: bool,
     ):
         span = _initial_warmup_span(interval, required_warmup)
+        max_total_span = _max_total_warmup_span(interval)
+        earliest_allowed_start: datetime | None = None
+        if max_total_span is not None and (end - start) <= max_total_span:
+            earliest_allowed_start = _safe_subtract(end, max_total_span)
         result = None
         eligible: list[AShareBar] = []
         excluded_open = 0
         for expansion in range(self.max_warmup_expansions + 1):
             candidate_start = _safe_subtract(start, span)
-            result = await self.hub.get_bars(
-                symbol,
-                interval,
-                candidate_start,
-                end,
-                adjust,
-                market,
-                asset_type,
-                allow_peers=allow_peers,
-            )
+            hit_span_cap = False
+            if earliest_allowed_start is not None and candidate_start <= earliest_allowed_start:
+                candidate_start = earliest_allowed_start
+                hit_span_cap = True
+            try:
+                current_result = await self.hub.get_bars(
+                    symbol,
+                    interval,
+                    candidate_start,
+                    end,
+                    adjust,
+                    market,
+                    asset_type,
+                    allow_peers=allow_peers,
+                )
+            except (InvalidRequest, ValueError):
+                if result is not None:
+                    break
+                raise
+            result = current_result
             bars = _sorted_unique(result.value)
             excluded_open = sum(1 for bar in bars if closed_only and not bar.is_closed)
             eligible = [bar for bar in bars if bar.is_closed or not closed_only]
@@ -282,7 +308,7 @@ class IndicatorEngine:
                     f"Indicator input exceeds the {self.max_input_rows}-row limit"
                 )
             loaded = sum(1 for bar in eligible if bar.ts < start)
-            if loaded >= required_warmup or required_warmup == 0:
+            if loaded >= required_warmup or required_warmup == 0 or hit_span_cap:
                 break
             if expansion == self.max_warmup_expansions:
                 break
@@ -422,6 +448,15 @@ def _finite_decimal(value: object) -> Decimal | None:
 def _sorted_unique(bars: Sequence[AShareBar]) -> list[AShareBar]:
     by_timestamp = {bar.ts: bar for bar in bars}
     return sorted(by_timestamp.values(), key=lambda bar: bar.ts)
+
+
+def _max_total_warmup_span(interval: Interval) -> timedelta | None:
+    """Keep intraday warm-up fetches inside peer HTTP /bars span limits (366d / 730d)."""
+    if interval is Interval.MINUTE_15:
+        return timedelta(days=365)
+    if interval is Interval.HOUR_1:
+        return timedelta(days=729)
+    return None
 
 
 def _initial_warmup_span(interval: Interval, lookback: int) -> timedelta:

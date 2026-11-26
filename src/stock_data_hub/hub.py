@@ -8,6 +8,7 @@ import random
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta
+from decimal import Decimal
 from math import isfinite
 from threading import Lock
 from time import perf_counter
@@ -19,9 +20,11 @@ from stock_data_hub.errors import (
     AllSourcesFailed,
     DataHubError,
     DataValidationError,
+    InvalidRequest,
     NoProviderConfigured,
     ProviderUnavailable,
     ResourceBusy,
+    SymbolDataUnavailable,
     UnsupportedCapability,
 )
 from stock_data_hub.health import ProviderHealth, SourceHealthRegistry
@@ -62,6 +65,7 @@ from stock_data_hub.normalization import (
 from stock_data_hub.providers.base import MarketDataProvider
 from stock_data_hub.trading_sessions import (
     latest_active_session_date,
+    period_anchor_date,
     period_end,
     window_has_trading_session,
 )
@@ -260,7 +264,9 @@ class DataHub:
         normalized_interval = Interval(interval)
         normalized_adjust = Adjust(adjust)
         normalized_asset_type = asset_type_from_symbol(normalized, asset_type)
-        start_bj, end_bj = normalize_bar_window(start, end, normalized_interval)
+        start_bj, end_bj = normalize_bar_window(
+            start, end, normalized_interval, market=normalized_market
+        )
         return await self._resolve(
             Capability.BARS,
             _cache_key(
@@ -386,48 +392,50 @@ class DataHub:
             if len(group_symbols) < 2:
                 continue
             route = _health_route(Capability.QUOTE, group_market, group_asset, None, None)
-            providers = self._providers_for(
-                Capability.QUOTE,
-                market=group_market,
-                asset_type=group_asset,
-                allow_peers=allow_peers,
-            )
-            for provider in providers:
-                if not provider.supports_batch_quotes or not self._health.can_attempt(
-                    provider.name, route
-                ):
-                    continue
-                timeout_seconds = (
-                    self._peer_timeout_seconds
-                    if provider.is_peer
-                    else self._provider_timeout_overrides.get(
-                        Capability.QUOTE, self._provider_timeout_seconds
-                    )
+            providers = [
+                provider
+                for provider in self._providers_for(
+                    Capability.QUOTE,
+                    market=group_market,
+                    asset_type=group_asset,
+                    allow_peers=allow_peers,
                 )
+                if provider.supports_batch_quotes
+                and self._health.can_attempt(provider.name, route)
+            ]
+            if not providers:
+                continue
 
-                async def warm(
-                    target_provider: MarketDataProvider = provider,
-                    target_symbols: list[str] = group_symbols,
-                    target_asset: AssetType = group_asset,
-                    target_timeout: float | None = timeout_seconds,
-                ) -> None:
+            async def warm_group(
+                candidate_providers: list[MarketDataProvider] = providers,
+                target_symbols: list[str] = group_symbols,
+                target_asset: AssetType = group_asset,
+            ) -> None:
+                for target_provider in candidate_providers:
+                    timeout_seconds = (
+                        self._peer_timeout_seconds
+                        if target_provider.is_peer
+                        else self._provider_timeout_overrides.get(
+                            Capability.QUOTE, self._provider_timeout_seconds
+                        )
+                    )
                     try:
                         await self._workers[target_provider.name].run(
-                            lambda: target_provider.prefetch_quotes(
+                            lambda p=target_provider: p.prefetch_quotes(
                                 target_symbols, asset_type=target_asset
                             ),
-                            timeout=target_timeout,
-                            queue_timeout=self._queue_timeout(target_timeout),
+                            timeout=timeout_seconds,
+                            queue_timeout=self._queue_timeout(timeout_seconds),
                         )
-                    except Exception as exc:  # noqa: BLE001 - best-effort pre-warm only
+                        return
+                    except Exception as exc:  # noqa: BLE001 - try next batch-capable fallback
                         logger.debug(
                             "Batch quote prefetch skipped for %s: %s",
                             target_provider.name,
                             _short_error(exc),
                         )
 
-                tasks.append(warm())
-                break
+            tasks.append(warm_group())
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -528,6 +536,7 @@ class DataHub:
         start: date | None = None,
         end: date | None = None,
         market: Market | str | None = None,
+        asset_type: AssetType | str | None = None,
         *,
         allow_peers: bool = True,
     ) -> DataResult[list[AdjustFactor]]:
@@ -535,7 +544,7 @@ class DataHub:
             raise ValueError("start must be before end")
         normalized = normalize_symbol(symbol, market)
         normalized_market = market_from_symbol(normalized)
-        normalized_asset = asset_type_from_symbol(normalized)
+        normalized_asset = asset_type_from_symbol(normalized, asset_type)
         return await self._resolve(
             Capability.ADJUST_FACTORS,
             _cache_key(
@@ -543,8 +552,11 @@ class DataHub:
                 normalized,
                 start.isoformat() if start is not None else "",
                 end.isoformat() if end is not None else "",
+                normalized_asset.value,
             ),
-            lambda provider: _fetch_adjust_factors(provider, normalized, start, end),
+            lambda provider: _fetch_adjust_factors(
+                provider, normalized, start, end, normalized_asset
+            ),
             market=normalized_market,
             asset_type=normalized_asset,
             allow_peers=allow_peers,
@@ -622,7 +634,7 @@ class DataHub:
             result = await asyncio.shield(shared)
             if result.metadata.stale:
                 self._count("stale_returns")
-            return result
+            return _clone_result(result)
         except DataHubError:
             self._count("failures")
             raise
@@ -686,7 +698,7 @@ class DataHub:
                 errors[provider.name] = "routing deadline exhausted"
                 all_empty = False
                 continue
-            allowed, is_probe = self._health.try_acquire_attempt(provider.name, health_route)
+            allowed, probe_id = self._health.try_acquire_attempt(provider.name, health_route)
             if not allowed:
                 errors[provider.name] = "circuit breaker is open"
                 all_empty = False
@@ -700,10 +712,11 @@ class DataHub:
                     health_route,
                     capability,
                     provider_deadline,
+                    probe_id=probe_id,
                 )
             finally:
-                if is_probe:
-                    self._health.finish_probe(provider.name, health_route)
+                if probe_id is not None:
+                    self._health.finish_probe(provider.name, health_route, probe_id)
 
             if error is None and payload is not None:
                 if payload.fetched_at is not None:
@@ -769,33 +782,28 @@ class DataHub:
                     )
 
         stale = self._cache_get_stale(raw_cache_key, allow_peers=allow_peers)
-        partial_is_fresh_eod = (
-            partial_candidate is not None
-            and partial_candidate[3]
-            and not partial_candidate[1].stale
-            and not (
-                partial_candidate[1].quality is not None
-                and (
-                    partial_candidate[1].quality.truncated
-                    or partial_candidate[1].quality.filtered_rows > 0
-                )
-            )
-        )
-        if stale is not None and not partial_is_fresh_eod:
+        if stale is not None and _prefer_stale_over_partial(stale, partial_candidate):
             return _cached_result(
                 stale,
                 stale=True,
                 warning="All live sources failed; returned the last verified cached result.",
             )
         if partial_candidate is not None:
-            provider, payload, _, _ = partial_candidate
+            provider, payload, _, is_eod_lag = partial_candidate
             if len(attempted) > 1 and attempted[0] != provider.name:
                 self._count("fallbacks")
             payload = replace(
                 payload, warnings=(*payload.warnings, "No complete fresh source was available.")
             )
             return self._store_result(
-                capability, raw_cache_key, cache_key, provider, payload, attempted, started_at
+                capability,
+                raw_cache_key,
+                cache_key,
+                provider,
+                payload,
+                attempted,
+                started_at,
+                is_eod_lag=is_eod_lag,
             )
         if empty_candidate is not None and all_empty:
             provider, payload, _ = empty_candidate
@@ -820,6 +828,8 @@ class DataHub:
         payload: SourcePayload[T],
         attempted: Sequence[str],
         started_at: float,
+        *,
+        is_eod_lag: bool = False,
     ) -> DataResult[T]:
         received_at = datetime.now(tz=BEIJING_TZ)
         fetched_at = to_beijing(payload.fetched_at) if payload.fetched_at else received_at
@@ -841,11 +851,13 @@ class DataHub:
         )
         if payload.quality and (payload.quality.truncated or payload.quality.filtered_rows):
             # An incomplete response must never replace a verified cached history.
-            return result
+            return _clone_result(result)
         policy = self._cache_policies[capability]
         age_delta = timedelta(seconds=age)
         fresh_remaining = max(policy.ttl - age_delta, timedelta())
-        if payload.stale:
+        if payload.stale or is_eod_lag:
+            # Stale or EOD-lagged fallback data is kept only for offline stale
+            # recovery and must never block live providers on subsequent calls.
             fresh_remaining = timedelta()
         elif (
             capability is Capability.BARS
@@ -860,8 +872,8 @@ class DataHub:
         target_key = (
             _peer_cache_key(raw_cache_key) if provider.is_peer else _local_cache_key(raw_cache_key)
         )
-        self._cache.set(target_key, result, fresh_remaining, stale_remaining)
-        return result
+        self._cache.set(target_key, _clone_result(result), fresh_remaining, stale_remaining)
+        return _clone_result(result)
 
     async def _attempt_provider(
         self,
@@ -870,6 +882,8 @@ class DataHub:
         health_route: str,
         capability: Capability,
         deadline: float,
+        *,
+        probe_id: int | None = None,
     ) -> tuple[SourcePayload[T] | None, float, Exception | None]:
         last_error: Exception | None = None
         total_latency_ms = 0.0
@@ -898,11 +912,25 @@ class DataHub:
                 return payload, total_latency_ms, None
             except UnsupportedCapability as exc:
                 return None, total_latency_ms, exc
+            except SymbolDataUnavailable as exc:
+                total_latency_ms += (perf_counter() - started_at) * 1000
+                self._health.record_transport_alive(
+                    provider.name, health_route, probe_id=probe_id
+                )
+                return None, total_latency_ms, exc
+            except InvalidRequest as exc:
+                total_latency_ms += (perf_counter() - started_at) * 1000
+                return None, total_latency_ms, exc
             except _EmptyBarsResult as exc:
                 total_latency_ms += (perf_counter() - started_at) * 1000
+                self._health.record_transport_alive(
+                    provider.name, health_route, probe_id=probe_id
+                )
                 return exc.payload, total_latency_ms, exc  # type: ignore[return-value]
             except WorkerBusy as exc:
-                self._health.record_capacity_rejection(provider.name, health_route)
+                self._health.record_capacity_rejection(
+                    provider.name, health_route, probe_id=probe_id
+                )
                 return None, total_latency_ms, exc
             except asyncio.TimeoutError:
                 total_latency_ms += (perf_counter() - started_at) * 1000
@@ -924,7 +952,7 @@ class DataHub:
                 await asyncio.sleep(min(base_delay + jitter, max(deadline - perf_counter(), 0)))
 
         assert last_error is not None
-        self._health.record_failure(provider.name, health_route, last_error)
+        self._health.record_failure(provider.name, health_route, last_error, probe_id=probe_id)
         return None, total_latency_ms, last_error
 
     def _queue_timeout(self, timeout_seconds: float | None) -> float:
@@ -1072,6 +1100,12 @@ def _health_route(
     return ":".join(parts)
 
 
+def _clone_result(result: DataResult[T]) -> DataResult[T]:
+    if isinstance(result.value, list):
+        return DataResult(value=list(result.value), metadata=result.metadata)  # type: ignore[arg-type]
+    return result
+
+
 def _cached_result(
     value: object,
     *,
@@ -1083,8 +1117,9 @@ def _cached_result(
     warnings = value.metadata.warnings
     if warning and warning not in warnings:
         warnings = (*warnings, warning)
+    cloned_value = list(value.value) if isinstance(value.value, list) else value.value
     return DataResult(
-        value=value.value,
+        value=cloned_value,
         metadata=replace(
             value.metadata,
             cache_hit=True,
@@ -1181,7 +1216,9 @@ def _fetch_bars(
         raise DataValidationError(
             "Provider returned no usable bars from incomplete or invalid history"
         )
-    if not payload.value and _bar_window_requires_data(start, end, market_from_symbol(symbol)):
+    if not payload.value and _bar_window_requires_data(
+        start, end, market_from_symbol(symbol), interval
+    ):
         raise _EmptyBarsResult(payload)
     return payload
 
@@ -1227,7 +1264,12 @@ def _fetch_adjust_factors(
     symbol: str,
     start: date | None,
     end: date | None,
+    asset_type: AssetType = AssetType.STOCK,
 ) -> SourcePayload[list[AdjustFactor]]:
+    if asset_type != AssetType.STOCK:
+        raise UnsupportedCapability(
+            f"Adjustment factors are only supported for stock symbols, not {asset_type.value} ({symbol})"
+        )
     payload = provider.fetch_adjust_factors(symbol, start, end)
     if not isinstance(payload, SourcePayload) or not isinstance(payload.value, list):
         raise DataValidationError("Provider adjust factors must be a SourcePayload containing a list")
@@ -1241,11 +1283,31 @@ def _fetch_adjust_factors(
             raise DataValidationError("Provider returned adjust factors for a different symbol or market")
         if factor.qfq_factor is None and factor.hfq_factor is None:
             raise DataValidationError("Provider returned an empty adjust factor row")
+        if (factor.qfq_factor is None) != (factor.qfq_offset is None):
+            raise DataValidationError(
+                "qfq_factor and qfq_offset must both be provided or both be None; "
+                "never substitute 0 for an unprovided offset"
+            )
+        if (factor.hfq_factor is None) != (factor.hfq_offset is None):
+            raise DataValidationError(
+                "hfq_factor and hfq_offset must both be provided or both be None; "
+                "never substitute 0 for an unprovided offset"
+            )
         if any(
             val is not None and (not val.is_finite() or val <= 0)
             for val in (factor.qfq_factor, factor.hfq_factor)
         ):
             raise DataValidationError("Provider returned a non-positive or non-finite adjust factor")
+        if any(
+            off is not None and not off.is_finite()
+            for off in (factor.qfq_offset, factor.hfq_offset)
+        ):
+            raise DataValidationError("Provider returned a non-finite adjust offset")
+        if expected_market == Market.CN and any(
+            off is not None and off != Decimal(0)
+            for off in (factor.qfq_offset, factor.hfq_offset)
+        ):
+            raise DataValidationError("Mainland China A-share adjust offsets must be 0")
         if (start is not None and factor.ex_date < start) or (
             end is not None and factor.ex_date > end
         ):
@@ -1259,6 +1321,8 @@ def normalize_bar_window(
     start: datetime,
     end: datetime,
     interval: Interval,
+    *,
+    market: Market = Market.CN,
 ) -> tuple[datetime, datetime]:
     """Normalize bar boundaries to Beijing time and date labels for daily+ intervals."""
 
@@ -1271,11 +1335,35 @@ def normalize_bar_window(
         end_day = end.date()
         if start_day > end_day:
             start_day, end_day = start_bj.date(), end_bj.date()
+        if interval in {Interval.WEEK_1, Interval.MONTH_1}:
+            end_day = max(end_day, period_anchor_date(end_day, interval, market))
         return (
             datetime.combine(start_day, time.min, tzinfo=BEIJING_TZ),
             datetime.combine(end_day, time.min, tzinfo=BEIJING_TZ),
         )
     return start_bj, end_bj
+
+
+def _prefer_stale_over_partial(
+    stale: object,
+    partial: tuple[MarketDataProvider, SourcePayload[object], float, bool] | None,
+) -> bool:
+    if partial is None:
+        return True
+    _, payload, _, _ = partial
+    if payload.stale:
+        return True
+    quality = payload.quality
+    if quality is not None and quality.truncated:
+        return True
+    return (
+        isinstance(stale, DataResult)
+        and stale.metadata.quality is not None
+        and stale.metadata.quality.available_end is not None
+        and quality is not None
+        and quality.available_end is not None
+        and quality.available_end < stale.metadata.quality.available_end
+    )
 
 
 def _pick_better_partial(
@@ -1289,26 +1377,35 @@ def _pick_better_partial(
 
 def _partial_rank(
     candidate: tuple[MarketDataProvider, SourcePayload[T], float, bool],
-) -> tuple[int, int, int, float, int]:
-    _, payload, _, _ = candidate
+) -> tuple[int, int, int, float, int, int]:
+    _, payload, _, is_eod_lag = candidate
     quality = payload.quality
     not_stale = int(not payload.stale)
     not_truncated = int(not (quality.truncated if quality is not None else False))
-    negative_filtered = -(quality.filtered_rows if quality is not None else 0)
+    not_eod_lag = int(not is_eod_lag)
     available_end_ts = (
         quality.available_end.timestamp()
         if quality is not None and quality.available_end is not None
         else (payload.fetched_at.timestamp() if payload.fetched_at is not None else 0.0)
     )
+    negative_filtered = -(quality.filtered_rows if quality is not None else 0)
     returned_rows = quality.returned_rows if quality is not None else 0
-    return (not_stale, not_truncated, negative_filtered, available_end_ts, returned_rows)
+    return (
+        not_stale,
+        not_truncated,
+        not_eod_lag,
+        available_end_ts,
+        negative_filtered,
+        returned_rows,
+    )
 
 
 def _bar_window_requires_data(
     start: datetime,
     end: datetime,
     market: Market = Market.CN,
+    interval: Interval = Interval.DAY_1,
 ) -> bool:
     """Distinguish an upstream empty response from a holiday/weekend/future query."""
 
-    return window_has_trading_session(start, end, market)
+    return window_has_trading_session(start, end, market, interval=interval)

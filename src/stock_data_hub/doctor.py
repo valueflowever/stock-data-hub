@@ -310,6 +310,7 @@ async def _execute_probe(
                 reference - timedelta(days=spec.lookback_days),
                 reference,
                 spec.interval,
+                market=spec.market,
             )
             payload = _fetch_bars(
                 provider,
