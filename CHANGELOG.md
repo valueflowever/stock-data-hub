@@ -1,5 +1,21 @@
 # 更新记录
 
+## 0.8.0
+
+### Data Contract 2.1 与核心金融契约升级
+
+- **复权因子仿射契约升级（`DATA_CONTRACT_VERSION = "2.1"`）**：`AdjustFactor` 新增显式 `qfq_offset` / `hfq_offset`（统一遵循 $P_{\text{adj}} = P_{\text{raw}} \times \text{factor} + \text{offset}$），严格区分“确定为 `0`”与“数据源未提供（`None`）”，禁止缺失 `offset` 静默回退为 `0`；将新浪 A 股除数型 `qfq_factor` 归一化为乘数，完整保留新浪港股后复权 `cash` 调整项，并禁用存在上游脏数据且缺失后复权的 AkShare 新浪美股复权因子。
+- **周线 / 月线跨源统一周期末锚点**：`WEEK_1` 与 `MONTH_1` 在解析与窗口归一化边界统一锚定到该周期内最后一个实际交易日（如周五，遇节假日顺延至节前最后交易日），消除 Yahoo（周初/月初标签）与国内数据源之间的日期错位。
+- **证券主表默认优先 `akshare`**：`Capability.INSTRUMENTS` 默认路由切换为 `("akshare", "efinance")`，开箱即默认合并沪深已退市股票及上市/退市日期，降低回测幸存者偏差。
+- **时区、日历与符号归一化加固**：拆分日线日期标签与分钟线真实小节时间交集判定，修复美股夏令时正午 `12:00 EDT`（北京时间次日零点）误判无交易、固定偏移 `+08:00` 与 `ZoneInfo` 不等价及跨年周线越界问题；收紧 `normalize_symbol` 美股兜底规则，避免 `SH600519.SH`、`HK00700` 或未知后缀符号静默误入美股路由。
+
+### 并发韧性、缓存安全与 HTTP 互备加固
+
+- **单标的无行情与路由熔断解耦**：新增 `SymbolDataUnavailable`，查询未上市/已退市代码或盘前/停牌无成交价标的时不再误记路由级熔断，消除 2 个无效代码触发全站报价熔断的级联风险。
+- **工作池、限流器与半开状态机修复**：修复 `BoundedWorkers` 在线程启动异常时的信号量双重释放与 FIFO 队列任务误删问题；将限流等待移至获取工作槽之前并支持协程取消时退还令牌；`SourceHealthRegistry` 引入探针令牌绑定与传输存活恢复。
+- **缓存隔离与 SQLite WAL 读降级修复**：内存缓存返回列表增加浅拷贝防原地篡改；`SQLiteResultCache` 隔离 60 秒惰性访问刷新写锁冲突（不再吞掉已解码命中结果），消除每次写入的无索引全表扫描；`BaoStockProvider` 显式标记历史 EOD 属性并升级为进程全局会话锁，禁止 EOD 滞后降级结果长时占用新鲜缓存。
+- **HTTP 服务与跨区互备加固**：新增免鉴权极简存活探针 `GET /livez`（配合 Docker `HEALTHCHECK`）与 `create_app` `lifespan` 关闭钩子；修复 `/bars` 混传 naive/aware 时间导致的 500 错误，为 `/indicator-computations` 补齐分钟线跨度护栏并限制指标预热最大回溯跨度；`RemoteHubProvider` 对路径参数全面百分号编码并兼容 Python 3.10 `'Z'` 时间戳；发版工作流增加 `pytest` 门禁。
+
 ## 0.7.1
 
 ### 核心金融准确性与指标修复

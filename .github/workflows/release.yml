@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing Git tag to publish (e.g. v0.7.0)"
+        description: "Existing Git tag to publish (e.g. v0.8.0)"
         required: true
         type: string
 
@@ -73,11 +73,14 @@ jobs:
               out.write(f"tag={tag}\n")
           PY
 
-      - name: Lint and build wheel and sdist
+      - name: Lint, test, and build wheel and sdist
+        env:
+          STOCK_DATA_HUB_REQUIRE_EXTRAS: core
         run: |
           rm -rf dist build
-          python -m pip install build ruff
+          python -m pip install -e ".[dev]"
           python -m ruff check src tests
+          python -m pytest -q
           python -m build
 
       - name: Publish GitHub Release

@@ -122,7 +122,8 @@ stock-data-hub doctor --json
 - **A 股 15m / 1h 分钟线**：`efinance` → `pytdx`（仅不复权）→ `akshare`（新浪分钟线最多只返约 1023 根，不够长时会自动切东财）→ `baostock` → `yfinance`
 - **港股 / 美股 K 线**：`tickflow`（日线以上）→ `akshare`（港股全周期、美股日线以上）→ `yfinance`（含分钟线）
 - **实时 / 延时报价**：A 股优先 `efinance` → `tencent` → `akshare` → `yfinance`；港美股优先 `tencent` → `akshare` → `yfinance`
-- **历史复权因子**：`baostock` → `akshare`
+- **证券主表（股票列表）**：`akshare`（默认合并退市股及上市/退市日）→ `efinance`
+- **历史复权因子**：`baostock` → `akshare`（A 股纯乘数、港股保留后复权现金调整项）
 
 如果你想自己调整顺序或关掉某个源，在初始化时传参即可：
 
@@ -156,12 +157,12 @@ hub = create_default_hub(
 - **价格用 `Decimal`**：避免浮点数出现 `10.199999999999999` 这类精度尾巴；HTTP 接口里统一返回字符串。
 - **成交量统一是“股”**：东方财富、PyTDX、TickFlow A 股原本返回的“手”已经自动乘了 100，**拿到数据后不要再自己乘 100**。成交额保留对应市场的本币（人民币、港币、美元）。
 - **分钟线时间统一标“收盘那一刻”**：比如早上 `09:45–10:00` 这根 15 分钟 K 线，时间固定是 `10:00+08:00`。像 Yahoo 这种原本标开盘时间的源会自动换算成收盘时间；美股最后半小时（`15:30–16:00` 美东时间）的 `1h` K 线也会准确对齐到 `16:00` 收盘，不会因为粗暴加 1 小时越界到 `16:30` 而丢数据。
-- **日线时间只是“日期标签”**：日线、周线、月线的 `ts` 统一写成该交易日的 `00:00:00+08:00`（例如美股 7 月 17 日的日线也是 `2026-07-17T00:00:00+08:00`），它只代表哪一天的 K 线，不代表收盘那一秒。判断这根 K 线收没收盘请看 `bar.is_closed` 字段（已处理好夏令时、节假日和半日市提前收盘）。
+- **日线时间只是“日期标签”，周线/月线统一锚定“周期内最后交易日”**：日线、周线、月线的 `ts` 统一写成该日期的 `00:00:00+08:00`。周线与月线跨源统一锚定到该周/该月最后一个实际交易日（如周五，周五休市则为周四），避免 Yahoo（标周初/月初）与国内源（标周期末）混用时错位。判断这根 K 线收没收盘请看 `bar.is_closed` 字段（已处理好夏令时、节假日和半日市提前收盘）。
 - **停牌空转行自动过滤**：有些数据源在股票停牌日会塞一行成交量为 0 的一字平盘数据，解析时会自动剔除并记录在 `metadata.quality.suspended_rows` 里，保证不同源拉出来的 K 线根数一致。
 
 ### 3. 前复权（`qfq`）、不复权（`none`）和复权因子怎么选？
 - **日常看盘或一次性拉完整区间算指标**：直接传 `Adjust.QFQ` 即可。注意东方财富的前复权用的是“算术减息法”（分红多的老股票很多年前的价格可能变成 0 或负数），而新浪、BaoStock、YFinance 用的是“等比复权法”；返回结果的 `metadata.quality.adjust_method` 会标明是 `arithmetic`、`proportional` 还是 `raw`。
-- **如果你要每天增量往自己的数据库里存历史数据**：**千万不要每天只拉当天的前复权价格直接往旧表后面追加**，否则一遇到分红送股，除权日前后的历史价格就会断层。正确做法是存 `Adjust.NONE`（原始不复权价），再配合复权因子接口动态计算：
+- **如果你要每天增量往自己的数据库里存历史数据**：**千万不要每天只拉当天的前复权价格直接往旧表后面追加**，否则一遇到分红送股，除权日前后的历史价格就会断层。正确做法是存 `Adjust.NONE`（原始不复权价），再配合复权因子接口（统一满足 $P_{\text{adj}} = P_{\text{raw}} \times \text{factor} + \text{offset}$，A 股纯乘数 `offset=0`，港股后复权保留现金调整项 `hfq_offset`）动态计算：
 
 ```python
 from datetime import date
@@ -244,17 +245,17 @@ stock-data-hub serve --host 0.0.0.0 --port 8000
 | 全市场快照 / 股票列表 / 交易日历 | `GET /snapshot`、`GET /instruments`、`GET /trade-calendar` |
 | 技术指标目录 / 批量计算指标 | `GET /indicators`、`POST /indicator-computations` |
 | 公司资料 / 公告 / 限售解禁 | `GET /company-profile/{symbol}`、`GET /disclosures/{symbol}`、`GET /restricted-releases/{symbol}` |
-| 美股收盘价 / 健康状态 / 运行计数 | `GET /us-daily-closes/{ticker}`、`GET /health`、`GET /metrics` |
+| 美股收盘价 / 存活探针 / 健康状态 / 运行计数 | `GET /us-daily-closes/{ticker}`、`GET /livez`（免密钥极简存活探针）、`GET /health`、`GET /metrics` |
 
 ### Docker 与国内外双节点互备
 
 仓库自带 `Dockerfile`：
 
 ```powershell
-docker build -t stock-data-hub:0.7.1 .
+docker build -t stock-data-hub:0.8.0 .
 docker run --rm -p 127.0.0.1:18767:8000 `
   -e STOCK_DATA_HUB_API_KEY=replace-with-a-long-random-secret `
-  stock-data-hub:0.7.1
+  stock-data-hub:0.8.0
 ```
 
 如果你在国内和海外各有一台机器，可以通过 `--peer-url`（或环境变量 `STOCK_DATA_HUB_PEER_URLS`、`STOCK_DATA_HUB_PEER_API_KEY`）把对方配成最终兜底节点：平时优先走本机直连；只有本机所有免费源都拿不到数据时，才去请求对端节点，并且会自动防循环转发。
