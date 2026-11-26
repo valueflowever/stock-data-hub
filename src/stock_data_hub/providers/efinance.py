@@ -4,14 +4,14 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable, Sequence
-from datetime import datetime, timezone
+from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
 import pandas as pd
 
 from stock_data_hub.cache import SharedFetchCache
-from stock_data_hub.errors import DataValidationError, ProviderUnavailable
+from stock_data_hub.errors import DataValidationError, ProviderUnavailable, SymbolDataUnavailable
 from stock_data_hub.models import (
     Adjust,
     AdjustMethod,
@@ -27,6 +27,7 @@ from stock_data_hub.models import (
     SourcePayload,
 )
 from stock_data_hub.normalization import (
+    BEIJING_TZ,
     asset_type_from_symbol,
     normalize_a_share_symbol,
     normalize_symbol,
@@ -36,7 +37,7 @@ from stock_data_hub.providers._parsing import (
     bar_payload_from_dataframe,
     decimal_or_none,
     record_value,
-    required_positive_decimal,
+    required_quote_price,
 )
 from stock_data_hub.providers.base import MarketDataProvider
 
@@ -138,7 +139,7 @@ class EFinanceProvider(MarketDataProvider):
         column = next((c for c in ("行情ID", "secid") if c in dataframe.columns), None)
         if column is None:
             return
-        fetched_at = datetime.now(tz=timezone.utc)
+        fetched_at = datetime.now(tz=BEIJING_TZ)
         normalized_ids = dataframe[column].astype(str).str.strip()
         for quote_id in quote_ids:
             matches = dataframe[normalized_ids == quote_id]
@@ -165,7 +166,7 @@ class EFinanceProvider(MarketDataProvider):
         return SourcePayload(
             value=Quote(
                 symbol=symbol,
-                price=required_positive_decimal(
+                price=required_quote_price(
                     record_value(row, "最新价", "price"), "latest price"
                 ),
                 ts=fetched.fetched_at,
@@ -278,13 +279,13 @@ def _quote_id(symbol: str) -> str:
 
 def _find_quote_row(dataframe: pd.DataFrame, quote_id: str) -> pd.Series:
     if not isinstance(dataframe, pd.DataFrame) or dataframe.empty:
-        raise DataValidationError("EFinance quote response was empty or invalid")
+        raise SymbolDataUnavailable("EFinance quote response was empty or invalid")
     column = next((c for c in ("行情ID", "secid") if c in dataframe.columns), None)
     if column is None:
         raise DataValidationError("EFinance quote response has no unambiguous market ID")
     matches = dataframe[dataframe[column].astype(str).str.strip() == quote_id]
     if len(matches) != 1:
-        raise DataValidationError(f"EFinance quote response has no unique row for {quote_id}")
+        raise SymbolDataUnavailable(f"EFinance quote response has no unique row for {quote_id}")
     return matches.iloc[0]
 
 

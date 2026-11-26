@@ -17,7 +17,12 @@ from typing import Any
 import pandas as pd
 
 from stock_data_hub.cache import SharedFetchCache
-from stock_data_hub.errors import DataValidationError, ProviderUnavailable, UnsupportedCapability
+from stock_data_hub.errors import (
+    DataValidationError,
+    ProviderUnavailable,
+    SymbolDataUnavailable,
+    UnsupportedCapability,
+)
 from stock_data_hub.models import (
     Adjust,
     AdjustFactor,
@@ -54,7 +59,7 @@ from stock_data_hub.providers._parsing import (
     decimal_or_none,
     is_missing,
     record_value,
-    required_positive_decimal,
+    required_quote_price,
     to_datetime,
 )
 from stock_data_hub.providers.base import MarketDataProvider
@@ -133,7 +138,10 @@ class AkShareProvider(MarketDataProvider):
         ):
             return False
         if capability == Capability.ADJUST_FACTORS:
-            return asset_type in {None, AssetType.STOCK}
+            return market in {None, Market.CN, Market.HK} and asset_type in {
+                None,
+                AssetType.STOCK,
+            }
         if capability in {Capability.BARS, Capability.QUOTE}:
             if market in {Market.HK, Market.US} and asset_type not in {
                 None,
@@ -145,7 +153,7 @@ class AkShareProvider(MarketDataProvider):
                 return interval in {Interval.DAY_1, Interval.WEEK_1, Interval.MONTH_1}
             return True
         if capability == Capability.US_DAILY_CLOSES:
-            return market in {None, Market.US}
+            return market in {None, Market.US} and adjust in {None, Adjust.NONE, Adjust.QFQ}
         return market in {None, Market.CN}
 
     def fetch_bars(
@@ -269,7 +277,7 @@ class AkShareProvider(MarketDataProvider):
                 warnings=warnings,
             )
 
-        expects_data = window_has_trading_session(start, end, market)
+        expects_data = window_has_trading_session(start, end, market, interval=interval)
         if self._prefer_sina_bars and can_use_sina:
             primary_name = "Sina"
             primary_fn = fetch_sina
@@ -294,11 +302,27 @@ class AkShareProvider(MarketDataProvider):
         primary_empty: SourcePayload[list[AShareBar]] | None = None
         try:
             payload = primary_fn()
-            if payload.value or not expects_data:
+            if payload.value:
+                if (
+                    payload.quality is not None
+                    and payload.quality.truncated
+                    and fallback_fn is not None
+                ):
+                    with suppress(Exception):
+                        complete_fallback = fallback_fn()
+                        if complete_fallback.value and not (
+                            complete_fallback.quality is not None
+                            and complete_fallback.quality.truncated
+                        ):
+                            return complete_fallback
+                return payload
+            if not expects_data:
                 return payload
             if payload.quality is not None and payload.quality.filtered_rows:
                 raise DataValidationError(f"{primary_name} returned no usable bars")
             primary_empty = payload
+        except SymbolDataUnavailable:
+            raise
         except Exception as primary_error:
             if fallback_fn is None:
                 raise ProviderUnavailable(
@@ -350,7 +374,7 @@ class AkShareProvider(MarketDataProvider):
                 return SourcePayload(
                     value=Quote(
                         symbol=normalized,
-                        price=required_positive_decimal(
+                        price=required_quote_price(
                             record_value(row, "最新价", "price"), "latest price"
                         ),
                         ts=fetched.fetched_at,
@@ -370,6 +394,8 @@ class AkShareProvider(MarketDataProvider):
                         else ()
                     ),
                 )
+            except SymbolDataUnavailable:
+                raise
             except Exception as exc:
                 raise ProviderUnavailable(
                     f"AkShare could not obtain a quote for {normalized}"
@@ -389,11 +415,11 @@ class AkShareProvider(MarketDataProvider):
         )
         row = next((row for row in payload.value.rows if row.symbol == normalized), None)
         if row is None:
-            raise DataValidationError(f"AkShare snapshot has no row for {normalized}")
+            raise SymbolDataUnavailable(f"AkShare snapshot has no row for {normalized}")
         return SourcePayload(
             Quote(
                 symbol=normalized,
-                price=required_positive_decimal(row.price, "latest price"),
+                price=required_quote_price(row.price, "latest price"),
                 ts=payload.value.fetched_at,
                 market=market,
             ),
@@ -577,6 +603,10 @@ class AkShareProvider(MarketDataProvider):
         *,
         adjust: Adjust = Adjust.NONE,
     ) -> SourcePayload[list[DailyClose]]:
+        if adjust == Adjust.HFQ:
+            raise UnsupportedCapability(
+                "AkShare Sina US daily history does not provide HFQ adjustment"
+            )
         normalized = ticker.upper().strip()
         ak = _load_akshare()
         us_daily_fn = _ak_fn(ak, "stock_us_daily", "stock_us_hist_sina")
@@ -609,21 +639,22 @@ class AkShareProvider(MarketDataProvider):
             raise UnsupportedCapability(
                 f"AkShare adjustment factors only support stock symbols, not {normalized}"
             )
+        if market not in {Market.CN, Market.HK}:
+            raise UnsupportedCapability(
+                f"AkShare does not provide verified adjustment factors for {market.value} symbol {normalized}"
+            )
         ak = _load_akshare()
         code = normalized.split(".", maxsplit=1)[0]
         try:
             if market == Market.CN:
                 fn = _ak_fn(ak, "stock_zh_a_daily", "stock_zh_a_hist_sina")
                 target = prefixed_a_share_symbol(normalized)
-            elif market == Market.HK:
+            else:
                 fn = _ak_fn(ak, "stock_hk_daily", "stock_hk_hist_sina")
                 target = code.zfill(5)
-            else:
-                fn = _ak_fn(ak, "stock_us_daily", "stock_us_hist_sina")
-                target = code
             qfq_df = fn(symbol=target, adjust="qfq-factor")
             hfq_df = fn(symbol=target, adjust="hfq-factor")
-        except UnsupportedCapability:
+        except (UnsupportedCapability, DataValidationError):
             raise
         except Exception as exc:
             raise ProviderUnavailable(
@@ -821,7 +852,7 @@ def _find_market_row(dataframe: pd.DataFrame | None, code: str, market: Market) 
         matches = dataframe[mask.fillna(False)]
         if not matches.empty:
             return matches.iloc[0]
-    raise DataValidationError(f"Quote response has no row for {code}")
+    raise SymbolDataUnavailable(f"Quote response has no row for {code}")
 
 
 def _eastmoney_us_symbol(ak: Any, ticker: str, *, spot_loader: Any = None) -> str:
@@ -1048,7 +1079,7 @@ def _fetch_single_cn_quote_em(ak: Any, symbol: str) -> SourcePayload[Quote]:
         str(row.get("item", "")).strip(): row.get("value")
         for row in dataframe.to_dict("records")
     }
-    price = required_positive_decimal(items.get("最新"), "latest price")
+    price = required_quote_price(items.get("最新"), "latest price")
     now = datetime.now(tz=BEIJING_TZ)
     return SourcePayload(
         value=Quote(symbol=symbol, price=price, ts=now, market=Market.CN),
@@ -1165,6 +1196,9 @@ def _fetch_cninfo_disclosures(
         title = _clean_text(record_value(row, "公告标题", "title"))
         if parsed_dt is None or not title:
             continue
+        announce_day = parsed_dt.date()
+        if announce_day < start or announce_day > end:
+            continue
         has_exact_time = (
             isinstance(raw_announce, datetime)
             or ":" in str(raw_announce)
@@ -1174,7 +1208,7 @@ def _fetch_cninfo_disclosures(
         disclosures.append(
             Disclosure(
                 symbol=normalized,
-                announce_date=parsed_dt.date(),
+                announce_date=announce_day,
                 title=title,
                 published_at=parsed_dt if has_exact_time else None,
             )
@@ -1197,32 +1231,56 @@ def _merge_factor_frames(
     start: date | None,
     end: date | None,
 ) -> list[AdjustFactor]:
-    qfq_map: dict[date, Decimal] = {}
-    hfq_map: dict[date, Decimal] = {}
+    qfq_map: dict[date, tuple[Decimal, Decimal]] = {}
+    hfq_map: dict[date, tuple[Decimal, Decimal]] = {}
     if isinstance(qfq_df, pd.DataFrame) and not qfq_df.empty:
         for row in qfq_df.to_dict("records"):
             day = _to_date(record_value(row, "date", "日期"))
             factor = decimal_or_none(record_value(row, "qfq_factor", "qfq-factor", "factor"))
-            if day is not None and factor is not None and factor > 0:
-                qfq_map[day] = factor
+            if day is None or factor is None or factor <= 0:
+                continue
+            if market == Market.CN:
+                # Sina CN applies ``P_qfq = P_raw / qfq_factor``; invert to canonical multiplier.
+                qfq_map[day] = (Decimal(1) / factor, Decimal(0))
+            elif market == Market.HK:
+                # Sina HK applies ``P_qfq = P_raw * qfq_factor`` (pure multiplicative).
+                qfq_map[day] = (factor, Decimal(0))
     if isinstance(hfq_df, pd.DataFrame) and not hfq_df.empty:
         for row in hfq_df.to_dict("records"):
             day = _to_date(record_value(row, "date", "日期"))
             factor = decimal_or_none(record_value(row, "hfq_factor", "hfq-factor", "factor"))
-            if day is not None and factor is not None and factor > 0:
-                hfq_map[day] = factor
+            if day is None or factor is None or factor <= 0:
+                continue
+            if market == Market.CN:
+                # Sina CN applies ``P_hfq = P_raw * hfq_factor``.
+                hfq_map[day] = (factor, Decimal(0))
+            elif market == Market.HK:
+                # Sina HK applies ``P_hfq = P_raw * hfq_factor + cash``; cash must never be dropped.
+                cash = decimal_or_none(record_value(row, "cash", "hfq_offset"))
+                if cash is None:
+                    raise DataValidationError(
+                        f"Sina HK hfq-factor row on {day.isoformat()} lacks required cash offset"
+                    )
+                hfq_map[day] = (factor, cash)
     all_days = sorted(set(qfq_map).union(hfq_map))
-    return [
-        AdjustFactor(
-            symbol=symbol,
-            ex_date=day,
-            qfq_factor=qfq_map.get(day),
-            hfq_factor=hfq_map.get(day),
-            market=market,
+    result: list[AdjustFactor] = []
+    for day in all_days:
+        if (start is not None and day < start) or (end is not None and day > end):
+            continue
+        qfq_pair = qfq_map.get(day)
+        hfq_pair = hfq_map.get(day)
+        result.append(
+            AdjustFactor(
+                symbol=symbol,
+                ex_date=day,
+                qfq_factor=qfq_pair[0] if qfq_pair is not None else None,
+                hfq_factor=hfq_pair[0] if hfq_pair is not None else None,
+                qfq_offset=qfq_pair[1] if qfq_pair is not None else None,
+                hfq_offset=hfq_pair[1] if hfq_pair is not None else None,
+                market=market,
+            )
         )
-        for day in all_days
-        if (start is None or day >= start) and (end is None or day <= end)
-    ]
+    return result
 
 
 def _six_digit_code(value: object) -> str | None:

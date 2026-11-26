@@ -11,7 +11,7 @@ from typing import Any
 
 import pandas as pd
 
-from stock_data_hub.errors import DataValidationError
+from stock_data_hub.errors import DataValidationError, SymbolDataUnavailable
 from stock_data_hub.models import (
     Adjust,
     AdjustMethod,
@@ -23,7 +23,12 @@ from stock_data_hub.models import (
     SourcePayload,
 )
 from stock_data_hub.normalization import BEIJING_TZ, is_bar_closed, to_beijing
-from stock_data_hub.trading_sessions import intraday_bar_close, market_timezone
+from stock_data_hub.trading_sessions import (
+    _is_beijing_midnight_label,
+    intraday_bar_close,
+    market_timezone,
+    period_anchor_date,
+)
 
 
 class IntradayTimestampLabel(str, Enum):
@@ -59,9 +64,10 @@ def bar_payload_from_dataframe(
 ) -> SourcePayload[list[AShareBar]]:
     diagnostics = ParseDiagnostics()
     adjust: Adjust = kwargs.get("adjust", Adjust.NONE)
+    asset_type: AssetType | None = kwargs.get("asset_type")
     resolved_adjust_method = (
         AdjustMethod.RAW.value
-        if adjust == Adjust.NONE
+        if adjust == Adjust.NONE or asset_type == AssetType.INDEX
         else (
             adjust_method.value
             if isinstance(adjust_method, AdjustMethod)
@@ -177,6 +183,7 @@ def bars_from_dataframe(
             continue
         if (
             interval == Interval.DAY_1
+            and market == Market.CN
             and asset_type != AssetType.INDEX
             and volume is not None
             and volume == 0
@@ -220,7 +227,12 @@ def normalize_bar_timestamp(
     timestamp = to_beijing(value)
     duration = _INTRADAY_DURATIONS.get(interval)
     if duration is None:
-        day = timestamp.astimezone(market_timezone(market)).date()
+        day = (
+            value.date()
+            if _is_beijing_midnight_label(value)
+            else timestamp.astimezone(market_timezone(market)).date()
+        )
+        day = period_anchor_date(day, interval, market)
         return datetime.combine(day, datetime.min.time(), tzinfo=BEIJING_TZ)
     if intraday_timestamp_label is None:
         raise ValueError(f"{interval.value} bars require an explicit intraday_timestamp_label")
@@ -285,6 +297,13 @@ def required_positive_decimal(value: object | None, field: str) -> Decimal:
     decimal = decimal_or_none(value)
     if decimal is None or decimal <= 0:
         raise DataValidationError(f"Missing or invalid {field}")
+    return decimal
+
+
+def required_quote_price(value: object | None, field: str = "latest price") -> Decimal:
+    decimal = decimal_or_none(value)
+    if decimal is None or decimal <= 0:
+        raise SymbolDataUnavailable(f"Missing or invalid {field}")
     return decimal
 
 

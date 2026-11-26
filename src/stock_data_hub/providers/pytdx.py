@@ -22,8 +22,12 @@ from stock_data_hub.models import (
     Market,
     SourcePayload,
 )
-from stock_data_hub.normalization import asset_type_from_symbol
-from stock_data_hub.providers._parsing import IntradayTimestampLabel, bar_payload_from_dataframe
+from stock_data_hub.normalization import BEIJING_TZ, asset_type_from_symbol, to_beijing
+from stock_data_hub.providers._parsing import (
+    IntradayTimestampLabel,
+    bar_payload_from_dataframe,
+    to_datetime,
+)
 from stock_data_hub.providers.base import MarketDataProvider
 
 _PYTDX_CATEGORIES = {
@@ -120,9 +124,14 @@ class PyTDXProvider(MarketDataProvider):
                         break
                     rows.extend(page)
                     frame = _to_frame(client, page)
-                    earliest = _earliest_bar_date(frame)
-                    if earliest is not None and earliest <= start.date():
-                        break
+                    if is_intraday:
+                        earliest_ts = _earliest_bar_timestamp(frame)
+                        if earliest_ts is not None and earliest_ts <= to_beijing(start):
+                            break
+                    else:
+                        earliest = _earliest_bar_date(frame)
+                        if earliest is not None and earliest <= start.date():
+                            break
                     if len(page) < self._page_size:
                         break
             except ProviderUnavailable as exc:
@@ -143,7 +152,20 @@ class PyTDXProvider(MarketDataProvider):
                 raise DataValidationError(
                     "PyTDX bars response could not be converted to a dataframe"
                 )
-            earliest_all = _earliest_bar_date(dataframe)
+            if is_intraday:
+                earliest_all_ts = _earliest_bar_timestamp(dataframe)
+                is_truncated = (
+                    len(rows) >= self._max_rows
+                    and earliest_all_ts is not None
+                    and earliest_all_ts > to_beijing(start)
+                )
+            else:
+                earliest_all = _earliest_bar_date(dataframe)
+                is_truncated = (
+                    len(rows) >= self._max_rows
+                    and earliest_all is not None
+                    and earliest_all > start.date()
+                )
             return bar_payload_from_dataframe(
                 dataframe,
                 source=f"pytdx:{server_host}:{server_port}",
@@ -158,9 +180,7 @@ class PyTDXProvider(MarketDataProvider):
                 intraday_timestamp_label=_PYTDX_INTRADAY_TIMESTAMP_LABEL if is_intraday else None,
                 adjust=adjust,
                 asset_type=resolved_asset,
-                truncated=len(rows) >= self._max_rows
-                and earliest_all is not None
-                and earliest_all > start.date(),
+                truncated=is_truncated,
             )
         assert last_error is not None
         raise last_error
@@ -223,6 +243,21 @@ def _apply_socket_timeout(client: Any, timeout: float) -> None:
     if callable(setter):
         with suppress(Exception):
             setter(timeout)
+
+
+def _earliest_bar_timestamp(dataframe: pd.DataFrame | None) -> datetime | None:
+    if dataframe is None or dataframe.empty:
+        return None
+    for column in ("datetime", "date"):
+        if column in dataframe.columns:
+            stamps = [
+                parsed
+                for val in dataframe[column].dropna().tolist()
+                if (parsed := to_datetime(val, naive_timezone=BEIJING_TZ)) is not None
+            ]
+            if stamps:
+                return min(stamps)
+    return None
 
 
 def _earliest_bar_date(dataframe: pd.DataFrame | None) -> date | None:

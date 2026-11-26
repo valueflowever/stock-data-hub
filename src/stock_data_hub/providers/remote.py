@@ -9,11 +9,17 @@ from decimal import Decimal, InvalidOperation
 from math import isfinite
 from typing import Any
 from urllib.error import HTTPError, URLError
+from urllib.parse import quote as url_quote
 from urllib.parse import urlencode, urlsplit
 from urllib.request import ProxyHandler, Request, build_opener, urlopen
 
 from stock_data_hub._workers import remaining_timeout
-from stock_data_hub.errors import DataValidationError, ProviderUnavailable
+from stock_data_hub.errors import (
+    DataValidationError,
+    InvalidRequest,
+    ProviderUnavailable,
+    SymbolDataUnavailable,
+)
 from stock_data_hub.models import (
     DATA_CONTRACT_VERSION,
     Adjust,
@@ -98,7 +104,7 @@ class RemoteHubProvider(MarketDataProvider):
         asset_type: AssetType | None = None,
     ) -> SourcePayload[list[AShareBar]]:
         body = self._get(
-            f"/bars/{symbol}",
+            f"/bars/{_path_segment(symbol)}",
             {
                 "start": start.isoformat(),
                 "end": end.isoformat(),
@@ -115,7 +121,8 @@ class RemoteHubProvider(MarketDataProvider):
             or metadata.get("contract_version") != DATA_CONTRACT_VERSION
         ):
             raise DataValidationError(
-                "Peer bars require data contract 2.0; upgrade the peer to avoid ambiguous volume units"
+                f"Peer bars require data contract {DATA_CONTRACT_VERSION}; "
+                "upgrade the peer to avoid incompatible volume or period semantics"
             )
         bars = [_parse_bar(item, symbol, interval, market, adjust) for item in _data_list(body)]
         if any(not start <= bar.ts <= end for bar in bars):
@@ -143,7 +150,7 @@ class RemoteHubProvider(MarketDataProvider):
         asset_type: AssetType | None = None,
     ) -> SourcePayload[Quote]:
         body = self._get(
-            f"/quote/{symbol}",
+            f"/quote/{_path_segment(symbol)}",
             {
                 "market": market_from_symbol(symbol).value,
                 "asset_type": asset_type.value if asset_type is not None else None,
@@ -176,7 +183,7 @@ class RemoteHubProvider(MarketDataProvider):
         params: dict[str, object | None] = {"max_rows": max_rows}
         if adjust != Adjust.NONE:
             params["adjust"] = adjust.value
-        body = self._get(f"/us-daily-closes/{ticker}", params)
+        body = self._get(f"/us-daily-closes/{_path_segment(ticker)}", params)
         closes: list[DailyClose] = []
         for item in _data_list(body):
             try:
@@ -198,13 +205,22 @@ class RemoteHubProvider(MarketDataProvider):
         end: date | None = None,
     ) -> SourcePayload[list[AdjustFactor]]:
         body = self._get(
-            f"/adjust-factors/{symbol}",
+            f"/adjust-factors/{_path_segment(symbol)}",
             {
                 "start": start.isoformat() if start is not None else None,
                 "end": end.isoformat() if end is not None else None,
                 "market": market_from_symbol(symbol).value,
             },
         )
+        metadata = body.get("metadata", {})
+        if (
+            not isinstance(metadata, Mapping)
+            or metadata.get("contract_version") != DATA_CONTRACT_VERSION
+        ):
+            raise DataValidationError(
+                f"Peer adjust factors require data contract {DATA_CONTRACT_VERSION}; "
+                "upgrade the peer to preserve explicit factor offsets"
+            )
         market = market_from_symbol(symbol)
         factors: list[AdjustFactor] = []
         for item in _data_list(body):
@@ -214,6 +230,8 @@ class RemoteHubProvider(MarketDataProvider):
                     ex_date=_date(item["ex_date"], "ex_date"),
                     qfq_factor=_nullable_decimal(item.get("qfq_factor"), "qfq_factor"),
                     hfq_factor=_nullable_decimal(item.get("hfq_factor"), "hfq_factor"),
+                    qfq_offset=_nullable_decimal(item.get("qfq_offset"), "qfq_offset"),
+                    hfq_offset=_nullable_decimal(item.get("hfq_offset"), "hfq_offset"),
                     market=Market(str(item.get("market", market.value))),
                 )
             except (KeyError, ValueError) as exc:
@@ -221,6 +239,12 @@ class RemoteHubProvider(MarketDataProvider):
             if factor.symbol != symbol or factor.market != market:
                 raise DataValidationError(
                     "Remote Hub returned adjust factors for a different symbol or market"
+                )
+            if (factor.qfq_factor is None) != (factor.qfq_offset is None) or (
+                factor.hfq_factor is None
+            ) != (factor.hfq_offset is None):
+                raise DataValidationError(
+                    "Remote Hub returned an adjust factor without a matching explicit offset"
                 )
             factors.append(factor)
         return _payload(body, factors, self.name)
@@ -285,7 +309,7 @@ class RemoteHubProvider(MarketDataProvider):
         return _payload(body, calendar, self.name)
 
     def fetch_company_profile(self, symbol: str) -> SourcePayload[CompanyProfile]:
-        body = self._get(f"/company-profile/{symbol}", {})
+        body = self._get(f"/company-profile/{_path_segment(symbol)}", {})
         data = _data_mapping(body)
         try:
             profile = CompanyProfile(
@@ -302,7 +326,7 @@ class RemoteHubProvider(MarketDataProvider):
         self,
         symbol: str,
     ) -> SourcePayload[list[RestrictedRelease]]:
-        body = self._get(f"/restricted-releases/{symbol}", {})
+        body = self._get(f"/restricted-releases/{_path_segment(symbol)}", {})
         releases: list[RestrictedRelease] = []
         for item in _data_list(body):
             try:
@@ -329,7 +353,7 @@ class RemoteHubProvider(MarketDataProvider):
         end: date,
     ) -> SourcePayload[list[Disclosure]]:
         body = self._get(
-            f"/disclosures/{symbol}",
+            f"/disclosures/{_path_segment(symbol)}",
             {"start": start.isoformat(), "end": end.isoformat()},
         )
         disclosures: list[Disclosure] = []
@@ -421,10 +445,14 @@ class RemoteHubProvider(MarketDataProvider):
             raise
         except HTTPError as exc:
             detail = _http_error_detail(exc)
-            raise ProviderUnavailable(
-                f"Remote Hub ({peer_label}) HTTP {exc.code} on {path}"
-                + (f": {detail}" if detail else "")
-            ) from exc
+            message = f"Remote Hub ({peer_label}) HTTP {exc.code} on {path}" + (
+                f": {detail}" if detail else ""
+            )
+            if exc.code in {400, 422}:
+                raise InvalidRequest(message) from exc
+            if "SymbolDataUnavailable" in detail:
+                raise SymbolDataUnavailable(message) from exc
+            raise ProviderUnavailable(message) from exc
         except (
             URLError,
             TimeoutError,
@@ -597,9 +625,19 @@ def _data_list(body: Mapping[str, Any]) -> list[Mapping[str, Any]]:
     return value
 
 
+def _path_segment(value: str) -> str:
+    cleaned = str(value or "").strip()
+    if not cleaned or cleaned in {".", ".."}:
+        raise InvalidRequest(f"Invalid remote path segment: {value!r}")
+    return url_quote(cleaned, safe="")
+
+
 def _datetime(value: object, field: str) -> datetime:
     try:
-        return to_beijing(datetime.fromisoformat(str(value)))
+        text = str(value).strip()
+        if text.endswith(("Z", "z")):
+            text = f"{text[:-1]}+00:00"
+        return to_beijing(datetime.fromisoformat(text))
     except ValueError as exc:
         raise DataValidationError(f"Remote Hub returned an invalid {field}") from exc
 

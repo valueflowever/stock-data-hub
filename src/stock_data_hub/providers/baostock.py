@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from contextlib import suppress
+from dataclasses import replace
 from datetime import date, datetime
+from decimal import Decimal
 from threading import RLock
 from typing import Any
 
@@ -34,6 +36,8 @@ from stock_data_hub.providers._parsing import (
 from stock_data_hub.providers.base import MarketDataProvider
 
 _BAOSTOCK_INTRADAY_TIMESTAMP_LABEL = IntradayTimestampLabel.CLOSE
+# BaoStock's official SDK shares one module-global TCP socket across the process.
+_BAOSTOCK_SESSION_LOCK = RLock()
 
 
 class BaoStockProvider(MarketDataProvider):
@@ -46,6 +50,7 @@ class BaoStockProvider(MarketDataProvider):
     adjustments = frozenset(Adjust)
     capabilities = frozenset({Capability.BARS, Capability.ADJUST_FACTORS})
     accepts_asset_type = True
+    supports_intraday_daily_bar = False
 
     def __init__(
         self,
@@ -55,7 +60,7 @@ class BaoStockProvider(MarketDataProvider):
     ) -> None:
         self._client_loader = client_loader
         self._timeout_seconds = timeout_seconds
-        self._lock = RLock()
+        self._lock = _BAOSTOCK_SESSION_LOCK
 
     def supports_request(
         self,
@@ -140,12 +145,15 @@ class BaoStockProvider(MarketDataProvider):
             finally:
                 with suppress(Exception):
                     client.logout()
+        suspended_pre_filtered = 0
         if not dataframe.empty and "tradestatus" in dataframe.columns:
             # Exclude suspended trading days so BaoStock matches other providers.
-            dataframe = dataframe[dataframe["tradestatus"].astype(str).str.strip() != "0"]
+            active_mask = dataframe["tradestatus"].astype(str).str.strip() != "0"
+            suspended_pre_filtered = int((~active_mask).sum())
+            dataframe = dataframe[active_mask]
         if is_intraday and not dataframe.empty:
             dataframe = _normalize_intraday_time(dataframe)
-        return bar_payload_from_dataframe(
+        payload = bar_payload_from_dataframe(
             dataframe,
             source="baostock",
             adjust_method=AdjustMethod.PROPORTIONAL,
@@ -159,6 +167,16 @@ class BaoStockProvider(MarketDataProvider):
             adjust=adjust,
             asset_type=resolved_asset,
         )
+        if suspended_pre_filtered and payload.quality is not None:
+            payload = replace(
+                payload,
+                quality=replace(
+                    payload.quality,
+                    input_rows=payload.quality.input_rows + suspended_pre_filtered,
+                    suspended_rows=payload.quality.suspended_rows + suspended_pre_filtered,
+                ),
+            )
+        return payload
 
     def fetch_adjust_factors(
         self,
@@ -210,8 +228,10 @@ class BaoStockProvider(MarketDataProvider):
                 ex_day = parsed_ts.date()
                 if (start is not None and ex_day < start) or (end is not None and ex_day > end):
                     continue
-                qfq = decimal_or_none(record_value(row, "foreAdjustFactor", "qfq_factor"))
-                hfq = decimal_or_none(record_value(row, "backAdjustFactor", "hfq_factor"))
+                qfq_raw = decimal_or_none(record_value(row, "foreAdjustFactor", "qfq_factor"))
+                hfq_raw = decimal_or_none(record_value(row, "backAdjustFactor", "hfq_factor"))
+                qfq = qfq_raw if qfq_raw is not None and qfq_raw > 0 else None
+                hfq = hfq_raw if hfq_raw is not None and hfq_raw > 0 else None
                 if qfq is None and hfq is None:
                     continue
                 by_date[ex_day] = AdjustFactor(
@@ -219,6 +239,8 @@ class BaoStockProvider(MarketDataProvider):
                     ex_date=ex_day,
                     qfq_factor=qfq,
                     hfq_factor=hfq,
+                    qfq_offset=Decimal(0) if qfq is not None else None,
+                    hfq_offset=Decimal(0) if hfq is not None else None,
                     market=Market.CN,
                 )
         return SourcePayload(

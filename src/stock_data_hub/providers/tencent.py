@@ -12,7 +12,12 @@ from urllib.request import ProxyHandler, Request, build_opener, urlopen
 
 from stock_data_hub._workers import remaining_timeout
 from stock_data_hub.cache import SharedFetchCache
-from stock_data_hub.errors import DataValidationError, ProviderUnavailable, UnsupportedCapability
+from stock_data_hub.errors import (
+    DataValidationError,
+    ProviderUnavailable,
+    SymbolDataUnavailable,
+    UnsupportedCapability,
+)
 from stock_data_hub.models import (
     AssetType,
     Capability,
@@ -27,7 +32,7 @@ from stock_data_hub.normalization import (
     normalize_symbol,
     to_beijing,
 )
-from stock_data_hub.providers._parsing import required_positive_decimal
+from stock_data_hub.providers._parsing import required_quote_price
 from stock_data_hub.providers.base import MarketDataProvider
 from stock_data_hub.trading_sessions import market_timezone
 
@@ -114,7 +119,7 @@ class TencentQuoteProvider(MarketDataProvider):
             raw_map = self._fetch_raw_map([key])
             payload_text = raw_map.get(key)
             if not payload_text:
-                raise DataValidationError(f"Tencent quote response has no row for {normalized}")
+                raise SymbolDataUnavailable(f"Tencent quote response has no row for {normalized}")
             return _parse_quote(normalized, payload_text, datetime.now(tz=BEIJING_TZ))
 
         fetched = self._cache.get(normalized, load)
@@ -135,7 +140,7 @@ class TencentQuoteProvider(MarketDataProvider):
             url,
             headers={
                 "Accept": "text/plain,*/*",
-                "User-Agent": "stock-data-hub/0.7.1",
+                "User-Agent": "stock-data-hub/0.8.0",
             },
             method="GET",
         )
@@ -171,7 +176,7 @@ def _parse_quote(symbol: str, payload: str, fallback_ts: datetime) -> Quote:
     parts = payload.split("~")
     if len(parts) <= 3:
         raise DataValidationError(f"Tencent quote payload is incomplete for {symbol}")
-    price = required_positive_decimal(parts[3].strip(), "latest price")
+    price = required_quote_price(parts[3].strip(), "latest price")
     market = market_from_symbol(symbol)
     ts = _parse_timestamp(parts, market) or fallback_ts
     freshness = QuoteFreshness.REALTIME if market == Market.CN else QuoteFreshness.DELAYED

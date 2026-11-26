@@ -218,7 +218,7 @@ _DEFAULT_PRIORITY: dict[Capability | RouteKey, tuple[str, ...]] = {
     RouteKey(Capability.QUOTE, Market.HK): ("tencent", "akshare", "yfinance"),
     RouteKey(Capability.QUOTE, Market.US): ("tencent", "akshare", "yfinance"),
     Capability.SNAPSHOT: ("efinance", "akshare"),
-    Capability.INSTRUMENTS: ("efinance", "akshare"),
+    Capability.INSTRUMENTS: ("akshare", "efinance"),
     Capability.TRADE_CALENDAR: ("akshare", "exchange_calendar"),
     Capability.COMPANY_PROFILE: ("cninfo", "akshare"),
     Capability.DISCLOSURES: ("cninfo", "akshare"),
